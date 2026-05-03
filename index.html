@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>1-bit Подземелье: Испытание Воли (Modular)</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            margin: 0; padding: 0; background-color: #000; color: #fff;
+            font-family: 'IBM Plex Mono', 'Consolas', monospace; overflow: hidden;
+            display: flex; justify-content: center; align-items: center; height: 100vh;
+        }
+        #gameWrapper { 
+            display: flex; gap: 20px; align-items: flex-start; 
+            transform-origin: center center;
+        }
+        #gameCanvas {
+            background-color: #000; border: 2px solid #fff;
+            box-shadow: 0 0 20px rgba(255, 255, 255, 0.1); cursor: crosshair;
+        }
+        .crt::before {
+            content: " "; display: block; position: absolute;
+            top: 0; left: 0; bottom: 0; right: 0;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            z-index: 2; background-size: 100% 2px, 3px 100%; pointer-events: none;
+        }
+        #sidePanel {
+            width: 300px; height: 600px; border: 2px solid #fff; background-color: #000;
+            box-sizing: border-box; padding: 20px; display: flex; flex-direction: column; z-index: 10;
+        }
+        #nodeInfo { flex-grow: 1; display: none; }
+        #nodeInfo h2 { margin-top: 0; font-size: 24px; border-bottom: 2px solid #fff; padding-bottom: 10px; text-transform: uppercase; }
+        #nodeInfo p { font-size: 16px; line-height: 1.5; color: #ccc; }
+        #niStatus { margin-top: 20px; font-weight: bold; font-size: 18px; }
+        .blink { animation: blink 1s step-end infinite; color: #fff; }
+        @keyframes blink { 50% { opacity: 0; } }
+        #guiContainer { margin-top: auto; }
+
+        /* Встроенные стили lil-gui для обхода блокировок CDN */
+        .lil-gui { 
+            --background-color: #000; --text-color: #fff; --title-background-color: #222;
+            --widget-color: #333; --hover-color: #555; --focus-color: #fff;
+            --number-color: #fff; --string-color: #fff; --font-family: 'IBM Plex Mono', 'Consolas', monospace;
+            border: 2px solid #fff; position: static !important; width: 100% !important;
+        }
+        .lil-gui .title { background: var(--title-background-color); padding: 5px; font-weight: bold; }
+    </style>
+</head>
+<body class="crt">
+    <div id="gameWrapper">
+        <canvas id="gameCanvas" width="800" height="600"></canvas>
+        <div id="sidePanel">
+            <div id="nodeInfo">
+                <h2 id="niTitle">УЗЕЛ</h2><p id="niDesc"></p><div id="niStatus"></div>
+            </div>
+            <div id="guiContainer"></div>
+        </div>
+    </div>
+    <script type="module" src="/src/index.ts"></script>
+</body>
+</html>
