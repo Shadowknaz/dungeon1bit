@@ -1,5 +1,3 @@
-import { AnimDef } from '../core/animatedSprite';
-
 export const ANIMATIONS = {
     // Игрок с пистолетом - новые детализированные анимации
     PLAYER_IDLE_DOWN: { frames: ['entity_player_pistol_d0'], fps: 1, loop: true },

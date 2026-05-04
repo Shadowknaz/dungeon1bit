@@ -39,6 +39,8 @@ export interface PlayerState {
     credits: number;
     status: string | null;
     statusTimer: number;
+    hasThermal?: boolean;
+    hasChalice?: boolean;
     anim?: AnimatedSprite;
 }
 
@@ -79,6 +81,8 @@ export function createPlayer(eid: number): PlayerState {
         carryingBarrel: null,
         credits: 0,
         status: null,
-        statusTimer: 0
+        statusTimer: 0,
+        hasThermal: false,
+        hasChalice: false
     };
 }

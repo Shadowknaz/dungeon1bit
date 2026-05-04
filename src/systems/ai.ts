@@ -3,6 +3,56 @@ import * as ROT from 'rot-js';
 import { Utils, Point, resolveCollision } from './physics';
 import { TILE_SIZE, ENEMY_BARKS } from '../core/constants';
 
+// Интерфейс для параметров обнаружения врагом на основе света
+export interface EnemyDetectionParams {
+  enemyPos: Point;
+  playerPos: Point;
+  playerLightLevel: number;  // 0-1, уровень света на позиции игрока
+  playerShadowIntensity: number;  // 0-1, интенсивность тени
+  baseDetectionRadius: number;  // базовый радиус видимости
+}
+
+/**
+ * Вычислить вероятность обнаружения игрока врагом на основе света
+ * Темнота помогает игроку скрываться, свет делает его видимым
+ */
+export function calculateEnemyDetectionChance(params: EnemyDetectionParams): number {
+  const { enemyPos, playerPos, playerLightLevel, playerShadowIntensity, baseDetectionRadius } = params;
+  
+  // Расстояние между врагом и игроком
+  const distance = Utils.dist(enemyPos, playerPos);
+  
+  // Эффективный радиус видимости зависит от света
+  // В тьме враг видит хуже (меньший радиус)
+  // На свету враг видит лучше (больший радиус)
+  const detectionRadius = baseDetectionRadius * (0.4 + playerLightLevel * 1.2);
+  
+  // Если игрок слишком далеко - враг не видит
+  if (distance > detectionRadius) return 0;
+  
+  // Базовая вероятность = чем ближе, тем выше (обратная зависимость от расстояния)
+  const proximityChance = Math.max(0, 1 - (distance / detectionRadius));
+  
+  // Модификатор на основе света
+  // Тень (высокая shadowIntensity) снижает видимость
+  // Свет (низкая shadowIntensity) повышает видимость
+  const lightModifier = 0.2 + playerLightLevel * 1.6;
+  
+  // Итоговая вероятность (0-1)
+  const detectionChance = proximityChance * lightModifier;
+  
+  return Math.min(1, Math.max(0, detectionChance));
+}
+
+/**
+ * Проверить, должен ли враг обнаружить игрока
+ */
+export function shouldEnemyDetectPlayer(params: EnemyDetectionParams, randomChance?: number): boolean {
+  const chance = calculateEnemyDetectionChance(params);
+  const roll = randomChance ?? Math.random();
+  return roll < chance;
+}
+
 export enum B3Status {
     SUCCESS = 1,
     FAILURE = 2,

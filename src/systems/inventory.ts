@@ -1,4 +1,4 @@
-import { ITEMS_DB, ItemData } from '../data/items';
+import { ITEMS_DB } from '../data/items';
 
 export interface ItemInstance {
     id: string;

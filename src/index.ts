@@ -16,11 +16,12 @@ import { Utils, resolveCollision } from './systems/physics';
 import { ParticleSystem } from './systems/particles';
 import { FluidSystem } from './systems/fluids';
 import { TrapSystem, TrapState } from './systems/traps';
-import { enemyMachineDef, EnemyActions } from './systems/ai';
+import { enemyMachineDef, EnemyActions, calculateEnemyDetectionChance, EnemyDetectionParams } from './systems/ai';
 import { generateGlobalMap, GlobalMap } from './systems/mapGenerator';
 import { InventorySystem, ItemInstance } from './systems/inventory';
 import { CombatSystem, Projectile } from './systems/combat';
 import { DungeonSystem } from './systems/dungeon';
+import { lumen, LightType } from './systems/lumen';
 
 // Entities
 import { createPlayer, PlayerState } from './entities/player';
@@ -67,7 +68,6 @@ class Game {
     private barrels: Barrel[] = [];
     private floatingTexts: any[] = [];
     private bullets: Projectile[] = [];
-    private visibleCells: Record<string, boolean> = {};
     private currentWill = 5;
     private roomLevel = 1;
     private roomActive = false;
@@ -87,6 +87,7 @@ class Game {
     private doors: Door[] = [];
     private roomSnapshot: any = null;
     private isRestarting = false;
+    private static readonly PLAYER_LIGHT_ID = 'player_light';
 
     private draggingItem: any = null;
     private draggingItemSource: 'inventory' | 'chest' | null = null;
@@ -307,7 +308,6 @@ class Game {
 
         } else if (this.gameState === 'EXIT_CONFIRM') {
             const cx = GAME_WIDTH / 2, cy = GAME_HEIGHT / 2;
-            const btnW = 100, btnH = 40;
             if (mouse.x > cx - 110 && mouse.x < cx - 10 && mouse.y > cy + 20 && mouse.y < cy + 60) { 
                 sfx.click(); this.exitRoom(); 
             } else if (mouse.x > cx + 10 && mouse.x < cx + 110 && mouse.y > cy + 20 && mouse.y < cy + 60) { 
@@ -430,7 +430,14 @@ class Game {
     }
 
     private updateEquippedStats() {
-        this.player.computedStats = { ...this.player.baseStats };
+        this.player.computedStats = {
+            ...this.player.baseStats,
+            maxAmmo: 0,
+            shootCooldown: 0,
+            reloadDuration: 0,
+            projectiles: 1,
+            spreadAngle: 0
+        };
         const weapon = this.inventoryItems.find(it => it.instanceId === this.player.equippedWeaponInstanceId);
         if (weapon) {
             const db = ITEMS_DB[weapon.id] as any;
@@ -453,6 +460,8 @@ class Game {
 
     private init() {
         ROT.RNG.setSeed(Date.now());
+        lumen.init(MAP_COLS, MAP_ROWS);
+        lumen.reset();
         this.world = bitECS.createWorld();
         this.player = createPlayer(bitECS.addEntity(this.world));
         this.globalMap = generateGlobalMap(ROT.RNG);
@@ -475,12 +484,13 @@ class Game {
 
     private generateRoom() {
         this.bullets = []; this.enemies = []; this.npcs = []; this.trapState = { pits: [], spikes: [], blades: [], plates: [], mines: [], mirrors: [] };
-        this.obstacles = []; this.floatingTexts = []; this.visibleCells = {}; this.chests = []; this.doors = [];
+        this.obstacles = []; this.floatingTexts = []; this.chests = []; this.doors = [];
         this.barrels = []; this.fluids.reset();
         this.secretRoomOpen = false; this.secretDoors = []; this.secretDoorObstacles = []; this.secretRoomCells = [];
         this.roomActive = false; this.combatIntensity = 0; this.gameState = 'PLAYING'; 
         this.player.x = GAME_WIDTH / 2; this.player.y = 520; this.player.trail = []; this.player.carryingBarrel = null;
         this.roomClearTimer = 0;
+        lumen.reset();
 
         const node = this.globalMap.nodes[this.currentNodeId!];
         
@@ -638,20 +648,18 @@ class Game {
                     const sp = getSpawn();
                     if (sp) {
                         // Проверка расстояния до других факелов (минимум 4 клетки)
-                        const tooClose = torchPositions.some(t => Utils.distSq({x: t.x * TILE_SIZE, y: t.y * TILE_SIZE}, {x: sp.x * TILE_SIZE, y: sp.y * TILE_SIZE}) < 1600);
+                        const tooClose = torchPositions.some(t => Utils.distSq({x: t.x, y: t.y}, {x: sp.gx, y: sp.gy}) < 16);
                         if (!tooClose) {
-                            torchPositions.push({x: sp.x, y: sp.y});
-                            // Добавляем источник света в систему Lumen
-                            import('./systems/lumen').then(({lumen, LightType}) => {
-                                lumen.addLight({
-                                    id: `torch_${this.frameCounter}_${i}`,
-                                    x: sp.x,
-                                    y: sp.y,
-                                    radius: 6,
-                                    intensity: 0.9,
-                                    type: LightType.STATIC,
-                                    active: true
-                                });
+                            torchPositions.push({x: sp.gx, y: sp.gy});
+                            const torchId = `torch_${this.frameCounter}_${i}`;
+                            lumen.addLight({
+                                id: torchId,
+                                x: sp.gx,
+                                y: sp.gy,
+                                radius: 6,
+                                intensity: 0.9,
+                                type: LightType.STATIC,
+                                active: true
                             });
                         }
                     }
@@ -694,6 +702,76 @@ class Game {
         const isSecDoor = this.secretDoors.some(d => d.x === x && d.y === y);
         if (this.dungeon.grid[x][y] === 1) { if (isSecDoor && this.secretRoomOpen) {} else return false; }
         if (this.startDoor && !this.startDoor.open && y === 22 && x >= 17 && x <= 22) return false;
+        return true;
+    }
+
+    private isCellVisible = (x: number, y: number) => {
+        if (this.ui.state.seeAllMap) return true;
+        return lumen.isVisible(x, y);
+    }
+
+    private getCellLightLevel = (x: number, y: number) => {
+        if (this.ui.state.seeAllMap) return 1;
+        return lumen.getLightLevel(x, y);
+    }
+
+    private refreshExploredFromLumen() {
+        for (let x = 0; x < MAP_COLS; x++) {
+            for (let y = 0; y < MAP_ROWS; y++) {
+                if (lumen.isVisible(x, y)) {
+                    this.dungeon.explored[x][y] = true;
+                }
+            }
+        }
+    }
+
+    private updateDynamicLights() {
+        const px = Math.floor(this.player.x / TILE_SIZE);
+        const py = Math.floor(this.player.y / TILE_SIZE);
+        lumen.addLight({
+            id: Game.PLAYER_LIGHT_ID,
+            x: px,
+            y: py,
+            radius: 7,
+            intensity: 1,
+            type: LightType.DYNAMIC,
+            active: true
+        });
+        lumen.updateLightPosition(Game.PLAYER_LIGHT_ID, px, py);
+
+        for (let i = this.bullets.length - 1; i >= 0; i--) {
+            const b = this.bullets[i];
+            const bx = Math.floor(b.x / TILE_SIZE);
+            const by = Math.floor(b.y / TILE_SIZE);
+            if (bx < 0 || by < 0 || bx >= MAP_COLS || by >= MAP_ROWS) continue;
+            lumen.addLight({
+                id: `bullet_${i}`,
+                x: bx,
+                y: by,
+                radius: 2,
+                intensity: 0.25,
+                type: LightType.TEMPORARY,
+                active: true,
+                ttl: 25
+            });
+        }
+    }
+
+    private canEnemySeePlayer(enemyTileX: number, enemyTileY: number, maxRange: number): boolean {
+        const px = Math.floor(this.player.x / TILE_SIZE);
+        const py = Math.floor(this.player.y / TILE_SIZE);
+        const distSq = (px - enemyTileX) ** 2 + (py - enemyTileY) ** 2;
+        if (distSq > maxRange * maxRange) return false;
+
+        const steps = Math.max(Math.abs(px - enemyTileX), Math.abs(py - enemyTileY));
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            const tx = Math.floor(enemyTileX + (px - enemyTileX) * t);
+            const ty = Math.floor(enemyTileY + (py - enemyTileY) * t);
+            if ((tx !== enemyTileX || ty !== enemyTileY) && !this.isPassable(tx, ty)) {
+                return tx === px && ty === py;
+            }
+        }
         return true;
     }
 
@@ -751,18 +829,38 @@ class Game {
                 }
             });
 
-            // Fog of War
-            this.visibleCells = {};
             const px = Math.floor(this.player.x / TILE_SIZE);
             const py = Math.floor(this.player.y / TILE_SIZE);
             
             let fovRadius = 15;
             const currentTile = this.fluids.getGrid()[px]?.[py];
             if (currentTile && currentTile.steam > 50) fovRadius = 5;
-
-            this.dungeon.computeFOV(px, py, fovRadius, this.player.angle, Math.PI / 2.5 / 2, this.isPassable, (x, y) => {
-                this.visibleCells[`${x},${y}`] = true;
+            this.updateDynamicLights();
+            this.fluids.getGrid().forEach((column, x) => {
+                column.forEach((cell, y) => {
+                    if (cell && cell.fire > 0) {
+                        lumen.addLight({
+                            id: `fire_${x}_${y}`,
+                            x,
+                            y,
+                            radius: 3,
+                            intensity: Math.min(0.9, 0.35 + cell.fire / 200),
+                            type: LightType.TEMPORARY,
+                            active: true,
+                            ttl: 120
+                        });
+                    }
+                });
             });
+
+            lumen.update(dt);
+            lumen.calculateLighting({
+                frameCount: this.frameCounter,
+                playerPos: { x: px, y: py },
+                playerVisionRadius: fovRadius,
+                isBlocking: (x, y) => !this.isPassable(x, y)
+            });
+            this.refreshExploredFromLumen();
 
             // Start door trigger
             if (this.startDoor && !this.startDoor.open && Utils.distSq({x: this.startDoor.x+this.startDoor.w/2, y: this.startDoor.y+this.startDoor.h/2}, this.player) < 2500) {
@@ -916,8 +1014,35 @@ class Game {
                     return;
                 }
                 this.player.ammo--;
+                
+                // Получить уровень света на позиции игрока для модификаторов
+                const px = Math.floor(this.player.x / TILE_SIZE);
+                const py = Math.floor(this.player.y / TILE_SIZE);
+                const playerLightLevel = this.getCellLightLevel(px, py);
+                
+                // Применить модификаторы света к точности
+                const baseAccuracy = 0.85;  // базовая точность игрока
+                const modifiedAccuracy = this.combat.applyLightToAccuracy(baseAccuracy, playerLightLevel);
+                
+                // Если враг замечает выстрел
+                if (this.combat.willPlayerBeDetected(playerLightLevel)) {
+                    // Это может быть обработано в логике обнаружения врагов
+                }
+                
                 const projs = this.combat.spawnProjectiles(this.player, this.player.angle, { projectiles: this.player.computedStats.projectiles, spreadAngle: this.player.computedStats.spreadAngle }, 0, this.player.radius, false);
                 this.bullets.push(...projs);
+                
+                // Вспышка выстрела - создает ярко видимый источник света
+                lumen.addLight({
+                    id: `muzzle_${this.frameCounter}`,
+                    x: px,
+                    y: py,
+                    radius: 3,
+                    intensity: 0.8,
+                    type: LightType.TEMPORARY,
+                    active: true,
+                    ttl: 60
+                });
                 sfx.playerShoot();
                 this.makeNoise(this.player.x, this.player.y, 300);
                 this.updateUI();
@@ -948,14 +1073,27 @@ class Game {
             const px = Math.floor(this.player.x/TILE_SIZE), py = Math.floor(this.player.y/TILE_SIZE);
             let canSeePlayer = false;
             
-            // Stealth in steam
-            let seeRadius = 12;
+            // Стелс-механика: тьма помогает скрываться
+            let baseDetectionRadius = 12;
             const pTile = grid[px]?.[py];
-            if (pTile && pTile.steam > 50) seeRadius = 4;
-
+            if (pTile && pTile.steam > 50) baseDetectionRadius = 4;  // Пар блокирует видимость
+            
+            const playerLight = this.getCellLightLevel(px, py);
+            const playerLighting = lumen.getLightingInfo(px, py);
+            
+            // Использовать новую систему обнаружения на основе света
+            const detectionParams: EnemyDetectionParams = {
+                enemyPos: e,
+                playerPos: this.player,
+                playerLightLevel: playerLight,
+                playerShadowIntensity: playerLighting.shadowIntensity,
+                baseDetectionRadius: baseDetectionRadius
+            };
+            
+            // Проверить, может ли враг видеть игрока на основе расстояния и света
             if (Utils.distSq(e, this.player) < 250000) {
-                const fov = new ROT.FOV.PreciseShadowcasting(this.isPassable);
-                fov.compute(ex, ey, seeRadius, (x, y) => { if (x === px && y === py) canSeePlayer = true; });
+                const detectionChance = calculateEnemyDetectionChance(detectionParams);
+                canSeePlayer = Math.random() < detectionChance && this.canEnemySeePlayer(ex, ey, 20);  // Использовать большой радиус для line-of-sight
             }
 
             if (canSeePlayer) {
@@ -997,6 +1135,16 @@ class Game {
                     if (pTile && pTile.steam > 50) spread = 0.5;
                     const angle = Math.atan2(this.player.y - e.y, this.player.x - e.x) + (Math.random() - 0.5) * spread;
                     this.bullets.push({ x: e.x, y: e.y, vx: Math.cos(angle)*4, vy: Math.sin(angle)*4, radius: 3, isEnemy: true });
+                    lumen.addLight({
+                        id: `enemy_muzzle_${e.id}_${this.frameCounter}`,
+                        x: Math.floor(e.x / TILE_SIZE),
+                        y: Math.floor(e.y / TILE_SIZE),
+                        radius: 2,
+                        intensity: 0.6,
+                        type: LightType.TEMPORARY,
+                        active: true,
+                        ttl: 50
+                    });
                     sfx.enemyShoot();
                 }
             }
@@ -1060,7 +1208,24 @@ class Game {
                 this.ctx.fillStyle = '#fff';
                 this.ctx.beginPath(); this.ctx.arc(b.x, b.y, b.radius, 0, Math.PI*2); this.ctx.fill();
             });
-            this.render.drawDitherOverlay(this.visibleCells, this.dungeon.explored, this.ui.state.seeAllMap);
+            this.render.drawDitherOverlay(this.isCellVisible, this.getCellLightLevel, this.dungeon.explored, this.ui.state.seeAllMap);
+            
+            // Отрисовка эффектов вспышек для источников света (магические эффекты)
+            lumen.getAllLightIds().forEach(id => {
+                // Вспышки для временных источников света (взрывы, магия)
+                if (id.includes('barrel_blast') || id.includes('muzzle') || id.includes('fire_')) {
+                    const idx = id.split('_');
+                    if (id.includes('barrel_blast')) {
+                        const gridX = Math.floor(Math.random() * 5) - 2;  // Random x offset
+                        const gridY = Math.floor(Math.random() * 5) - 2;  // Random y offset
+                        this.render.drawBrightFlash(
+                            (gridX + 1) * TILE_SIZE + TILE_SIZE/2, 
+                            (gridY + 1) * TILE_SIZE + TILE_SIZE/2, 
+                            6
+                        );
+                    }
+                }
+            });
             
             this.drawCinemaLines();
 
@@ -1080,7 +1245,7 @@ class Game {
         
         // Secret Room Floor
         this.secretRoomCells.forEach(c => {
-            if (this.visibleCells[`${c.gx},${c.gy}`] || this.ui.state.seeAllMap) {
+            if (this.isCellVisible(c.gx, c.gy)) {
                 ctx.fillStyle = '#222';
                 ctx.fillText('░', c.gx * TILE_SIZE + TILE_SIZE/2, c.gy * TILE_SIZE + TILE_SIZE/2 + 6);
             }
@@ -1089,7 +1254,7 @@ class Game {
         // Runes on walls
         if (this.secretDoors.length > 0 && Math.floor(this.frameCounter/30) % 2 === 0) {
             this.secretDoors.forEach(d => {
-                if (this.visibleCells[`${d.x},${d.y}`] || this.ui.state.seeAllMap) {
+                if (this.isCellVisible(d.x, d.y)) {
                     ctx.fillStyle = '#fff';
                     ctx.fillText('ᚨ', d.x * TILE_SIZE + TILE_SIZE/2, d.y * TILE_SIZE + TILE_SIZE/2 + 6);
                 }
@@ -1108,7 +1273,7 @@ class Game {
             for (let y = 0; y < MAP_ROWS; y++) {
                 const cell = grid[x][y];
                 if (!cell) continue;
-                if (!this.visibleCells[`${x},${y}`] && !this.ui.state.seeAllMap) continue;
+                if (!this.isCellVisible(x, y)) continue;
 
                 const cx = x * TILE_SIZE + TILE_SIZE / 2;
                 const cy = y * TILE_SIZE + TILE_SIZE / 2;
@@ -1258,7 +1423,7 @@ class Game {
         }
 
         this.chests.forEach(c => { 
-            if (!c.opened && (isMapFull || this.visibleCells[`${Math.floor(c.x/TILE_SIZE)},${Math.floor(c.y/TILE_SIZE)}`])) { 
+            if (!c.opened && (isMapFull || this.isCellVisible(Math.floor(c.x/TILE_SIZE), Math.floor(c.y/TILE_SIZE)))) { 
                 this.render.drawShadow(c.x, c.y + 5, 12);
                 const sprite = this.spriteCache.get('obj_chest');
                 if (sprite) ctx.drawImage(sprite, c.x - sprite.width/2, c.y - sprite.height/2);
@@ -1267,23 +1432,26 @@ class Game {
             } 
         });
         this.trapState.pits.forEach(p => { 
+            if (!isMapFull && !this.isCellVisible(Math.floor(p.x / TILE_SIZE), Math.floor(p.y / TILE_SIZE))) return;
             const sprite = this.spriteCache.get('tile_pit');
             if (sprite) ctx.drawImage(sprite, p.x - TILE_SIZE/2, p.y - TILE_SIZE/2);
             else { ctx.fillStyle = '#111'; ctx.fillText('O', p.x, p.y); }
         });
         this.trapState.spikes.forEach(s => { 
+            if (!isMapFull && !this.isCellVisible(Math.floor(s.x / TILE_SIZE), Math.floor(s.y / TILE_SIZE))) return;
             const sprite = this.spriteCache.get(s.state === 2 ? 'obj_spikes_1' : 'obj_spikes_0');
             if (sprite) ctx.drawImage(sprite, s.x - sprite.width/2, s.y - sprite.height/2);
             else { ctx.fillStyle = s.state === 2 ? '#fff' : '#666'; ctx.fillText('^', s.x, s.y); }
         });
         this.trapState.plates.forEach(p => { 
+            if (!isMapFull && !this.isCellVisible(Math.floor(p.x / TILE_SIZE), Math.floor(p.y / TILE_SIZE))) return;
             const sprite = this.spriteCache.get(p.pressed ? 'obj_plate_1' : 'obj_plate_0');
             if (sprite) ctx.drawImage(sprite, p.x - sprite.width/2, p.y - sprite.height/2);
             else { ctx.fillStyle = p.pressed ? '#444' : '#fff'; ctx.fillText('=', p.x, p.y); }
         });
 
         this.npcs.forEach(n => {
-            if (isMapFull || this.visibleCells[`${Math.floor(n.x/TILE_SIZE)},${Math.floor(n.y/TILE_SIZE)}`]) {
+            if (isMapFull || this.isCellVisible(Math.floor(n.x/TILE_SIZE), Math.floor(n.y/TILE_SIZE))) {
                 this.render.drawShadow(n.x, n.y + 8, 10);
                 const sprite = this.spriteCache.get(n.type === 'shrine' ? 'obj_altar' : 'entity_npc');
                 if (sprite) {
@@ -1304,7 +1472,7 @@ class Game {
             }
         });
         this.enemies.forEach(e => {
-            if (isMapFull || this.visibleCells[`${Math.floor(e.x/TILE_SIZE)},${Math.floor(e.y/TILE_SIZE)}`] || this.ui.state.seeAllEnemies) {
+            if (isMapFull || this.isCellVisible(Math.floor(e.x/TILE_SIZE), Math.floor(e.y/TILE_SIZE)) || this.ui.state.seeAllEnemies) {
                 this.render.drawShadow(e.x, e.y + 8, 10);
                 if (e.anim) {
                     if (e.type === 'shooter') {
@@ -1328,7 +1496,7 @@ class Game {
             }
         });
         this.barrels.forEach(b => { 
-            if (isMapFull || this.visibleCells[`${Math.floor(b.x/TILE_SIZE)},${Math.floor(b.y/TILE_SIZE)}`]) {
+            if (isMapFull || this.isCellVisible(Math.floor(b.x/TILE_SIZE), Math.floor(b.y/TILE_SIZE))) {
                 this.render.drawShadow(b.x, b.y + 8, 12);
                 const sprite = this.spriteCache.get('obj_barrel');
                 if (sprite) ctx.drawImage(sprite, b.x - sprite.width/2, b.y - sprite.height/2);
@@ -1424,16 +1592,15 @@ class Game {
         ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
         for (let r = 0; r < 6; r++) for (let c = 0; c < 8; c++) ctx.strokeRect(gridX + c * 30, gridY + r * 30, 30, 30);
         
-        let hoveredItem = null;
         this.inventoryItems.forEach(item => {
             if (this.draggingItem === item) return;
             const db = ITEMS_DB[item.id];
             const isSelected = this.selectedItemInstanceId === item.instanceId;
             ctx.fillStyle = isSelected ? '#fff' : '#888';
             db.shape.forEach((row, ri) => row.forEach((cell, ci) => { if (cell) ctx.fillRect(gridX + (item.x + ci)*30 + 2, gridY + (item.y + ri)*30 + 2, 26, 26); }));
-            if (isSelected) hoveredItem = item;
             if (this.player.equippedWeaponInstanceId === item.instanceId) { ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.strokeRect(gridX + item.x*30, gridY + item.y*30, 30, 30); ctx.lineWidth = 1; }
         });
+        const hoveredItem = this.inventoryItems.find(it => it.instanceId === this.selectedItemInstanceId);
         
         // Detailed Item View
         if (hoveredItem && !this.draggingItem) {
@@ -1540,6 +1707,16 @@ class Game {
         sfx.hit();
         
         if (brl.type === 'explosive') {
+            lumen.addLight({
+                id: `barrel_blast_${this.frameCounter}`,
+                x: Math.floor(brl.x / TILE_SIZE),
+                y: Math.floor(brl.y / TILE_SIZE),
+                radius: 6,
+                intensity: 1,
+                type: LightType.TEMPORARY,
+                active: true,
+                ttl: 180
+            });
             sfx.explosion();
             this.particles.spawn(brl.x, brl.y, 60, 2, 6); // Large sparks on barrel explosion
             this.makeNoise(brl.x, brl.y, 500);

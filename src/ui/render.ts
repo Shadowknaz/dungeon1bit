@@ -4,10 +4,13 @@ import { SpriteCache } from '../core/spriteCache';
 
 export class RenderSystem {
     private ditherPattern: CanvasPattern | null = null;
+    private ditherPatterns: Map<string, CanvasPattern> = new Map();
     private staticCanvas: HTMLCanvasElement;
     private sCtx: CanvasRenderingContext2D;
+    private ctx: CanvasRenderingContext2D;
 
-    constructor(private ctx: CanvasRenderingContext2D, private spriteCache: SpriteCache) {
+    constructor(ctx: CanvasRenderingContext2D, private spriteCache: SpriteCache) {
+        this.ctx = ctx;
         this.staticCanvas = document.createElement('canvas');
         this.staticCanvas.width = GAME_WIDTH;
         this.staticCanvas.height = GAME_HEIGHT;
@@ -21,30 +24,61 @@ export class RenderSystem {
     }
 
     private initDither() {
-        // Улучшенный паттерн дизеринга с более плавным переходом
-        const ditherCanvas = document.createElement('canvas');
-        ditherCanvas.width = 4;
-        ditherCanvas.height = 4;
-        const dCtx = ditherCanvas.getContext('2d', { alpha: false })!;
-        dCtx.fillStyle = '#000'; 
-        dCtx.fillRect(0, 0, 4, 4);
-        
-        // Более мягкий паттерн для лучшей видимости
-        dCtx.fillStyle = '#333'; 
-        dCtx.fillRect(0, 0, 1, 1); 
-        dCtx.fillRect(2, 1, 1, 1);
-        dCtx.fillRect(1, 2, 1, 1); 
-        dCtx.fillRect(3, 2, 1, 1);
-        dCtx.fillRect(0, 3, 1, 1); 
-        dCtx.fillRect(2, 3, 1, 1);
+        // Создать несколько дизеринг паттернов для разных уровней света
+        const patterns = ['light', 'medium', 'dark'];
+        const intensities = [0.25, 0.5, 0.75];
 
-        const ditherPatternCanvas = document.createElement('canvas');
-        ditherPatternCanvas.width = 4;
-        ditherPatternCanvas.height = 4;
-        const dpCtx = ditherPatternCanvas.getContext('2d')!;
-        dpCtx.globalAlpha = 0.3;
-        dpCtx.drawImage(ditherCanvas, 0, 0);
-        this.ditherPattern = this.ctx.createPattern(ditherPatternCanvas, 'repeat');
+        patterns.forEach((patternName, idx) => {
+            const ditherCanvas = document.createElement('canvas');
+            ditherCanvas.width = 4;
+            ditherCanvas.height = 4;
+            const dCtx = ditherCanvas.getContext('2d', { alpha: false })!;
+            
+            dCtx.fillStyle = '#000'; 
+            dCtx.fillRect(0, 0, 4, 4);
+            
+            // Разные паттерны дизеринга для разных уровней света
+            if (patternName === 'light') {
+                // Минимальный дизеринг - редкие черные пиксели
+                dCtx.fillStyle = '#333'; 
+                dCtx.fillRect(0, 3, 1, 1); 
+                dCtx.fillRect(2, 1, 1, 1);
+            } else if (patternName === 'medium') {
+                // Средний дизеринг - вероятностный паттерн
+                dCtx.fillStyle = '#333'; 
+                dCtx.fillRect(0, 0, 1, 1); 
+                dCtx.fillRect(2, 1, 1, 1);
+                dCtx.fillRect(1, 2, 1, 1); 
+                dCtx.fillRect(3, 2, 1, 1);
+                dCtx.fillRect(0, 3, 1, 1); 
+                dCtx.fillRect(2, 3, 1, 1);
+            } else {
+                // Тяжелый дизеринг - густой паттерн для полутени
+                dCtx.fillStyle = '#333'; 
+                dCtx.fillRect(0, 0, 1, 1); 
+                dCtx.fillRect(2, 0, 1, 1);
+                dCtx.fillRect(1, 1, 1, 1);
+                dCtx.fillRect(3, 1, 1, 1);
+                dCtx.fillRect(0, 2, 1, 1); 
+                dCtx.fillRect(2, 2, 1, 1);
+                dCtx.fillRect(1, 3, 1, 1);
+                dCtx.fillRect(3, 3, 1, 1);
+            }
+
+            const ditherPatternCanvas = document.createElement('canvas');
+            ditherPatternCanvas.width = 4;
+            ditherPatternCanvas.height = 4;
+            const dpCtx = ditherPatternCanvas.getContext('2d')!;
+            dpCtx.globalAlpha = intensities[idx];
+            dpCtx.drawImage(ditherCanvas, 0, 0);
+            const pattern = this.ctx.createPattern(ditherPatternCanvas, 'repeat');
+            if (pattern) {
+                this.ditherPatterns.set(patternName, pattern);
+            }
+        });
+
+        // Основной паттерн дизеринга (по умолчанию средний)
+        this.ditherPattern = this.ditherPatterns.get('medium') || null;
     }
 
     private getWallMask(x: number, y: number, grid: number[][]): string {
@@ -130,16 +164,84 @@ export class RenderSystem {
         this.ctx.restore();
     }
 
-    public drawDitherOverlay(visibleCells: Record<string, boolean>, explored: boolean[][], seeAllMap: boolean) {
+    public drawDitherOverlay(
+        isVisible: (x: number, y: number) => boolean,
+        getLightLevel: (x: number, y: number) => number,
+        explored: boolean[][],
+        seeAllMap: boolean
+    ) {
         if (seeAllMap) return;
+        
         for (let x = 0; x < MAP_COLS; x++) {
             for (let y = 0; y < MAP_ROWS; y++) {
-                if (!visibleCells[`${x},${y}`]) {
-                    this.ctx.fillStyle = explored[x][y] ? this.ditherPattern! : '#000';
+                const visible = isVisible(x, y);
+                if (visible) continue;
+
+                const light = getLightLevel(x, y);
+                if (!explored[x][y]) {
+                    // Полная чернота - неисследованная область
+                    this.ctx.fillStyle = '#000';
                     this.ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                    continue;
                 }
+
+                // Динамический дизеринг в зависимости от уровня света
+                if (light > 0.6) {
+                    // Яркая полутень - легкое затемнение
+                    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+                } else if (light > 0.35) {
+                    // Средняя полутень - модеральное затемнение
+                    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+                } else if (light > 0.15) {
+                    // Темная полутень - сильное затемнение с дизерингом
+                    const pattern = this.ditherPatterns.get('dark');
+                    if (pattern) {
+                        this.ctx.fillStyle = pattern;
+                    } else {
+                        this.ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+                    }
+                } else {
+                    // Почти полная тьма - полный дизеринг
+                    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+                }
+                this.ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
             }
         }
+    }
+
+    /**
+     * Применить эффект вспышки (инверсия цветов для магических эффектов)
+     */
+    public drawFlashEffect(x: number, y: number, radius: number, intensity: number) {
+        this.ctx.save();
+        this.ctx.globalCompositeOperation = 'lighten';
+        
+        const gradient = this.ctx.createRadialGradient(x, y, 0, x, y, radius * TILE_SIZE);
+        gradient.addColorStop(0, `rgba(255, 255, 255, ${intensity})`);
+        gradient.addColorStop(1, `rgba(255, 255, 255, 0)`);
+        
+        this.ctx.fillStyle = gradient;
+        this.ctx.beginPath();
+        this.ctx.arc(x, y, radius * TILE_SIZE, 0, Math.PI * 2);
+        this.ctx.fill();
+        
+        this.ctx.restore();
+    }
+
+    /**
+     * Применить эффект локальной инверсии для обозначения сверхъярких источников
+     */
+    public drawBrightFlash(x: number, y: number, radius: number) {
+        this.ctx.save();
+        this.ctx.globalCompositeOperation = 'screen';
+        
+        this.ctx.fillStyle = '#fff';
+        this.ctx.globalAlpha = 0.3;
+        this.ctx.beginPath();
+        this.ctx.arc(x, y, radius * TILE_SIZE, 0, Math.PI * 2);
+        this.ctx.fill();
+        
+        this.ctx.restore();
     }
 }
 

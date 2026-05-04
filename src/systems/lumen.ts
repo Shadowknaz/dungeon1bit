@@ -1,10 +1,4 @@
-/**
- * Lumen - Система динамического освещения для 1-битной игры
- * Использует алгоритм Shadowcasting для расчета видимости (FOV)
- * и генерирует карту освещенности для дизеринга.
- */
-
-import { GameState, Point } from '../types';
+import { Point } from '../types';
 
 // Типы источников света
 export enum LightType {
@@ -23,16 +17,38 @@ export interface LightSource {
   color?: string;      // Для будущих эффектов (сейчас 1-бит, но полезно для логики)
   active: boolean;
   ttl?: number;        // Время жизни для временных источников
+  lastX?: number;      // Для отслеживания движения (dirty flags)
+  lastY?: number;
 }
 
 // Карта освещенности: значение от 0 (тьма) до 1 (полный свет)
 export type LightMap = Float32Array;
 
-// Кэш видимости для оптимизации (Dirty Flags)
 interface VisibilityCache {
-  map: Uint8Array; // 0 - не видно, 1 - видно
-  dirty: boolean;
+  map: Uint8Array;
   lastUpdateFrame: number;
+}
+
+export interface LightingFrameInput {
+  frameCount: number;
+  playerPos: Point;
+  playerVisionRadius: number;
+  isBlocking: (x: number, y: number) => boolean;
+}
+
+// Интерфейс для информации об освещенности для игровых систем
+export interface LightingInfo {
+  lightLevel: number;        // 0-1, уровень света
+  isVisible: boolean;        // Видна ли клетка
+  shadowIntensity: number;   // 0-1, интенсивность тени (1 - полная тьма)
+  ditherPattern: number;     // 0-15, паттерн дизеринга
+}
+
+// Интерфейс для модификаторов боя на основе света
+export interface CombatLightModifier {
+  accuracyModifier: number;  // Множитель на точность (0.5-1.5)
+  damageModifier: number;    // Множитель на урон в тени (0.8-1.2)
+  detectionRadius: number;   // Радиус обнаружения врагом игрока
 }
 
 class LumenSystem {
@@ -42,233 +58,153 @@ class LumenSystem {
   private lightMap: LightMap | null = null;
   private visibilityCache: VisibilityCache | null = null;
 
-  // Паттерны дизеринга (Bayer Matrix 4x4)
-  private ditherMatrix = [
-    [0, 8, 2, 10],
-    [12, 4, 14, 6],
-    [3, 11, 1, 9],
-    [15, 7, 13, 5]
-  ];
+  // Множество дизеринг паттернов для разных уровней света
+  private ditherPatterns = {
+    // Минимальный дизеринг (0.7-1.0) - почти освещено
+    light: [
+      [0, 12, 3, 15],
+      [8, 4, 11, 7],
+      [2, 14, 1, 13],
+      [10, 6, 9, 5]
+    ],
+    // Средний дизеринг (0.4-0.7) - полутень
+    medium: [
+      [0, 8, 2, 10],
+      [12, 4, 14, 6],
+      [3, 11, 1, 9],
+      [15, 7, 13, 5]
+    ],
+    // Тяжелый дизеринг (0-0.4) - почти тьма
+    dark: [
+      [15, 7, 13, 5],
+      [3, 11, 1, 9],
+      [12, 4, 14, 6],
+      [0, 8, 2, 10]
+    ]
+  };
+
+  // Dirty flags - отслеживание измененных областей
+  private dirtyRegions: Set<string> = new Set();
+  private lastLightSourcesHash: string = '';
+  private lastPlayerPos: Point | null = null;
+  private lastPlayerVisionRadius: number = 0;
 
   constructor() {}
 
-  /**
-   * Инициализация системы
-   */
   init(width: number, height: number) {
     this.width = width;
     this.height = height;
     this.lightMap = new Float32Array(width * height);
     this.visibilityCache = {
       map: new Uint8Array(width * height),
-      dirty: true,
       lastUpdateFrame: 0
     };
   }
 
-  /**
-   * Добавление источника света
-   */
+  reset() {
+    this.lightSources.clear();
+    this.dirtyRegions.clear();
+    this.lastLightSourcesHash = '';
+    this.lastPlayerPos = null;
+    if (this.lightMap) this.lightMap.fill(0);
+    if (this.visibilityCache) {
+      this.visibilityCache.map.fill(0);
+      this.visibilityCache.lastUpdateFrame = 0;
+    }
+  }
+
   addLight(source: LightSource) {
     this.lightSources.set(source.id, source);
-    if (this.visibilityCache) this.visibilityCache.dirty = true;
+    source.lastX = source.x;
+    source.lastY = source.y;
+    this.markDirty(source.x, source.y, source.radius);
   }
 
-  /**
-   * Обновление позиции динамического источника
-   */
   updateLightPosition(id: string, x: number, y: number) {
     const source = this.lightSources.get(id);
-    if (source && (source.x !== x || source.y !== y)) {
+    if (source) {
+      const oldX = source.x;
+      const oldY = source.y;
       source.x = x;
       source.y = y;
-      if (source.type === LightType.DYNAMIC && this.visibilityCache) {
-        this.visibilityCache.dirty = true;
-      }
+      // Отметить обе области как грязные (старую и новую)
+      this.markDirty(oldX, oldY, source.radius);
+      this.markDirty(x, y, source.radius);
     }
   }
 
-  /**
-   * Удаление источника света
-   */
   removeLight(id: string) {
-    if (this.lightSources.delete(id) && this.visibilityCache) {
-      this.visibilityCache.dirty = true;
+    const source = this.lightSources.get(id);
+    if (source) {
+      this.markDirty(source.x, source.y, source.radius);
     }
+    this.lightSources.delete(id);
   }
 
-  /**
-   * Проверка блокирует ли клетка свет (стены, объекты)
-   */
-  private isBlocking(gameState: GameState, x: number, y: number): boolean {
-    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return true;
-    
-    // Проверяем стены в текущей комнате
-    const room = gameState.currentRoom;
-    if (!room) return true;
-
-    // Локальные координаты в комнате
-    const localX = x; 
-    const localY = y;
-
-    if (localY >= 0 && localY < room.map.length && localX >= 0 && localX < room.map[0].length) {
-      const tile = room.map[localY][localX];
-      // Стены (1), объекты (3+) могут блокировать свет. Пол (0) - нет.
-      // Можно настроить пороги блокировки
-      return tile === 1 || tile >= 3; 
-    }
-    return true;
+  getAllLightIds(): string[] {
+    return Array.from(this.lightSources.keys());
   }
 
-  /**
-   * Алгоритм Shadowcasting для расчета видимости
-   * Рекурсивно проверяет октанты от источника света
-   * (Зарезервировано для будущего использования)
-   */
-  private castShadow(
-    gameState: GameState,
-    x: number, y: number, 
-    row: number, 
-    start: number, _end: number, 
-    xx: number, xy: number, 
-    yx: number, yy: number, 
-    radius: number,
-    visibleMap: Uint8Array
-  ) {
-    let slopeNextRow = start - 1;
-
-    for (let j = row; j <= radius; j++) {
-      let blocked = false;
-      let dx = -j - 1;
-      
-      for (let i = -j; i <= 0; i++) {
-        let dy = -i;
-        let lSlope = (dx + 0.5) / (dy - 0.5);
-        let rSlope = (dx - 0.5) / (dy + 0.5);
-
-        if (!(start > rSlope)) {
-          let cx = x + dx * xx + dy * xy;
-          let cy = x + dx * yx + dy * yy;
-          
-          // Проверка границ и блокировки
-          if (cx >= 0 && cx < this.width && cy >= 0 && cy < this.height) {
-             // Преобразуем в индекс массива видимости (упрощенно считаем плоскую карту для всего уровня или текущей комнаты)
-             // Для простоты используем глобальные координаты если они есть, или локальные
-             // Здесь предполагаем, что x,y уже в координатах карты освещения
-             
-             // Если это первая строка радиуса и мы внутри радиуса - помечаем как видимое
-             if (j <= radius) {
-                const idx = cy * this.width + cx;
-                if (idx >= 0 && idx < visibleMap.length) {
-                    visibleMap[idx] = 1;
-                }
-             }
-          }
-        }
-
-        if (blocked) {
-          if (this.isBlocking(gameState, x + dx * xx + dy * xy, x + dx * yx + dy * yy)) {
-            slopeNextRow = lSlope;
-            continue;
-          } else {
-            blocked = false;
-            start = slopeNextRow;
-          }
-        } else {
-          if (this.isBlocking(gameState, x + dx * xx + dy * xy, x + dx * yx + dy * yy) && j < radius) {
-            blocked = true;
-            this.castShadow(gameState, x, y, j + 1, start, lSlope, xx, xy, yx, yy, radius, visibleMap);
-            slopeNextRow = lSlope;
-          }
-        }
-        start = rSlope;
-        dx++;
-      }
-      if (blocked) break;
-    }
+  private inBounds(x: number, y: number): boolean {
+    return x >= 0 && x < this.width && y >= 0 && y < this.height;
   }
 
-  /**
-   * Расчет полной карты освещенности
-   * Вызывается каждый кадр или по флагу dirty
-   */
-  calculateLighting(gameState: GameState, playerPos: Point) {
-    if (!this.lightMap || !this.visibilityCache) return;
+  // Отметить область как требующую пересчета
+  private markDirty(cx: number, cy: number, radius: number) {
+    const key = `${Math.floor(cx)},${Math.floor(cy)},${Math.floor(radius)}`;
+    this.dirtyRegions.add(key);
+  }
 
-    const { map } = this.visibilityCache;
-    
-    // Очистка карты видимости
-    map.fill(0);
-
-    // 1. Расчет видимости от игрока (динамический источник)
-    // Используем упрощенный Raycasting для скорости вместо полного рекурсивного shadowcast на каждый кадр
-    // Или оптимизированный shadowcast только для игрока
-    this.computeFOV(gameState, playerPos.x, playerPos.y, 8, map);
-
-    // 2. Расчет статических источников (факелы)
-    // Оптимизация: пересчитываем только если карта изменилась или источник новый
-    // Для простоты в демо-режиме пересчитываем вклад всех источников
-    
-    this.lightMap.fill(0);
-
-    // Функция добавления света в карту
-    const addLightContribution = (lx: number, ly: number, radius: number, intensity: number) => {
-      const rSquared = radius * radius;
-      const minX = Math.max(0, lx - radius);
-      const maxX = Math.min(this.width - 1, lx + radius);
-      const minY = Math.max(0, ly - radius);
-      const maxY = Math.min(this.height - 1, ly + radius);
-
-      for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-          const dx = x - lx;
-          const dy = y - ly;
-          const distSq = dx * dx + dy * dy;
-
-          if (distSq <= rSquared) {
-            const dist = Math.sqrt(distSq);
-            // Затухание света: 1 - (dist / radius)^2
-            let falloff = 1.0 - (dist / radius);
-            falloff = falloff * falloff; // Квадратичное затухание для мягкости
-            
-            // Проверка видимости (если точка не видна ни одному источнику, она темная)
-            // Упрощение: считаем, что если точка в радиусе и не за стеной прямой видимости - она освещена
-            // Для полноценной работы нужно проверять LOS от источника до точки
-            
-            const idx = y * this.width + x;
-            if (idx >= 0 && idx < this.lightMap.length) {
-              // Берем максимум от всех источников
-              const contribution = falloff * intensity;
-              if (contribution > this.lightMap[idx]) {
-                this.lightMap[idx] = contribution;
-              }
-            }
-          }
-        }
-      }
-    };
-
-    // Применяем свет от игрока
-    addLightContribution(playerPos.x, playerPos.y, 8, 1.0);
-
-    // Применяем свет от статических источников
-    this.lightSources.forEach(source => {
-      if (source.active && source.type === LightType.STATIC) {
-        const src = source;
-        // Оптимизация: можно кэшировать статический свет и пересчитывать только при изменении геометрии
-        addLightContribution(src.x, src.y, src.radius, src.intensity);
+  // Получить хеш текущего состояния источников света для dirty flags
+  private getLightSourcesHash(): string {
+    let hash = '';
+    this.lightSources.forEach((s, id) => {
+      if (s.active) {
+        hash += `${id}:${s.x},${s.y},${s.intensity};`;
       }
     });
-
-    this.visibilityCache.lastUpdateFrame = gameState.frameCount || 0;
-    this.visibilityCache.dirty = false;
+    return hash;
   }
 
-  /**
-   * Упрощенный расчет FOV (Raycasting) для видимости
-   */
-  private computeFOV(gameState: GameState, cx: number, cy: number, radius: number, visibleMap: Uint8Array) {
-    const steps = radius * 8; // Количество лучей
+  calculateLighting(input: LightingFrameInput) {
+    if (!this.lightMap || !this.visibilityCache) return;
+
+    const { frameCount, playerPos, playerVisionRadius, isBlocking } = input;
+
+    // Проверка dirty flags - пересчитать если изменилось
+    const newHash = this.getLightSourcesHash();
+    const playerPosChanged = !this.lastPlayerPos || 
+      this.lastPlayerPos.x !== playerPos.x || 
+      this.lastPlayerPos.y !== playerPos.y;
+    const visionRadiusChanged = this.lastPlayerVisionRadius !== playerVisionRadius;
+    const lightsChanged = newHash !== this.lastLightSourcesHash;
+
+    if (playerPosChanged || visionRadiusChanged || lightsChanged || this.dirtyRegions.size > 0) {
+      const { map } = this.visibilityCache;
+      map.fill(0);
+      this.lightMap.fill(0);
+
+      this.computeVisibility(playerPos.x, playerPos.y, playerVisionRadius, map, isBlocking);
+      this.addLightContribution(playerPos.x, playerPos.y, playerVisionRadius, 1.0, isBlocking);
+
+      this.lightSources.forEach(source => {
+        if (source.active) {
+          this.addLightContribution(source.x, source.y, source.radius, source.intensity, isBlocking);
+        }
+      });
+
+      this.dirtyRegions.clear();
+    }
+
+    this.lastLightSourcesHash = newHash;
+    this.lastPlayerPos = { ...playerPos };
+    this.lastPlayerVisionRadius = playerVisionRadius;
+    this.visibilityCache.lastUpdateFrame = frameCount;
+  }
+
+  private computeVisibility(cx: number, cy: number, radius: number, visibleMap: Uint8Array, isBlocking: (x: number, y: number) => boolean) {
+    if (!this.inBounds(cx, cy)) return;
+    const steps = Math.max(64, radius * 16);
     for (let i = 0; i < steps; i++) {
       const angle = (Math.PI * 2 * i) / steps;
       const dx = Math.cos(angle);
@@ -281,23 +217,58 @@ class LumenSystem {
         const tx = Math.floor(x);
         const ty = Math.floor(y);
 
-        if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) break;
+        if (!this.inBounds(tx, ty)) break;
 
         const idx = ty * this.width + tx;
-        visibleMap[idx] = 1; // Помечаем как видимое
+        visibleMap[idx] = 1;
 
-        if (this.isBlocking(gameState, tx, ty)) {
-          break; // Луч упёрся в стену
+        if (isBlocking(tx, ty)) {
+          break;
         }
 
         x += dx;
         y += dy;
       }
     }
-    // Центральная клетка всегда видна
+
     const centerIdx = cy * this.width + cx;
-    if (centerIdx >= 0 && centerIdx < visibleMap.length) {
-        visibleMap[centerIdx] = 1;
+    visibleMap[centerIdx] = 1;
+  }
+
+  private hasLineOfSight(x0: number, y0: number, x1: number, y1: number, isBlocking: (x: number, y: number) => boolean): boolean {
+    const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const x = Math.floor(x0 + (x1 - x0) * t);
+      const y = Math.floor(y0 + (y1 - y0) * t);
+      if ((x !== x0 || y !== y0) && isBlocking(x, y)) {
+        return x === x1 && y === y1;
+      }
+    }
+    return true;
+  }
+
+  private addLightContribution(lx: number, ly: number, radius: number, intensity: number, isBlocking: (x: number, y: number) => boolean) {
+    if (!this.lightMap) return;
+    const rSquared = radius * radius;
+    const minX = Math.max(0, lx - radius);
+    const maxX = Math.min(this.width - 1, lx + radius);
+    const minY = Math.max(0, ly - radius);
+    const maxY = Math.min(this.height - 1, ly + radius);
+
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        const dx = x - lx;
+        const dy = y - ly;
+        const distSq = dx * dx + dy * dy;
+        if (distSq > rSquared) continue;
+        if (!this.hasLineOfSight(lx, ly, x, y, isBlocking)) continue;
+
+        const dist = Math.sqrt(distSq);
+        const falloff = Math.pow(Math.max(0, 1 - dist / radius), 2);
+        const idx = y * this.width + x;
+        this.lightMap[idx] = Math.max(this.lightMap[idx], falloff * intensity);
+      }
     }
   }
 
@@ -314,18 +285,108 @@ class LumenSystem {
    * Проверка видимости клетки для ИИ или механик
    */
   isVisible(x: number, y: number): boolean {
-    if (!this.visibilityCache || x < 0 || x >= this.width || y < 0 || y >= this.height) return false;
+    if (!this.visibilityCache || !this.inBounds(x, y)) return false;
     return this.visibilityCache.map[y * this.width + x] === 1;
+  }
+
+  /**
+   * Получить информацию об освещенности для клетки
+   * Используется для UI, AI и боевых модификаторов
+   */
+  getLightingInfo(x: number, y: number): LightingInfo {
+    const lightLevel = this.getLightLevel(x, y);
+    const visible = this.isVisible(x, y);
+    const shadowIntensity = 1 - lightLevel;
+    const ditherPattern = this.getDitherThreshold(x, y);
+
+    return {
+      lightLevel,
+      isVisible: visible,
+      shadowIntensity,
+      ditherPattern
+    };
+  }
+
+  /**
+   * Получить дизеринг паттерн в зависимости от уровня света
+   */
+  private selectDitherPattern(lightLevel: number): number[][] {
+    if (lightLevel > 0.7) return this.ditherPatterns.light;
+    if (lightLevel > 0.4) return this.ditherPatterns.medium;
+    return this.ditherPatterns.dark;
   }
 
   /**
    * Генерация порогового значения для дизеринга на основе координат и освещенности
    */
   getDitherThreshold(x: number, y: number): number {
-    // Bayer matrix 4x4 нормализованная (0-1)
-    const bx = x % 4;
-    const by = y % 4;
-    return (this.ditherMatrix[by][bx] + 0.5) / 16.0;
+    const lightLevel = this.getLightLevel(x, y);
+    const pattern = this.selectDitherPattern(lightLevel);
+    const bx = ((x % 4) + 4) % 4;
+    const by = ((y % 4) + 4) % 4;
+    return (pattern[by][bx] + 0.5) / 16.0;
+  }
+
+  /**
+   * Получить динамический дизеринг паттерн для визуализации
+   * Возвращает матрицу для текущего уровня света
+   */
+  getDitherPatternForLight(lightLevel: number): number[][] {
+    return this.selectDitherPattern(lightLevel);
+  }
+
+  /**
+   * Рассчить модификаторы боя на основе освещенности
+   * Тьма дает преимущество игроку (меньше видимость), штраф врагам
+   */
+  getCombatLightModifier(x: number, y: number): CombatLightModifier {
+    const lightLevel = this.getLightLevel(x, y);
+    
+    // Точность: в полной тьме лучше скрытатьс, но хуже атаковать
+    // В свете: хуже скрытаться, но лучше атаковать
+    const accuracyModifier = 0.5 + lightLevel * 1.0; // 0.5 в тьме, 1.5 на свету
+
+    // Урон в тени немного повышается (скрытая позиция)
+    const damageModifier = 0.95 + (1 - lightLevel) * 0.25; // 1.2 в тьме, 0.95 на свету
+
+    // Радиус обнаружения врагом игрока зависит от света
+    const baseDetectionRadius = 10;
+    const detectionRadius = baseDetectionRadius * (0.5 + lightLevel * 0.5); // 5 в тьме, 10 на свету
+
+    return {
+      accuracyModifier,
+      damageModifier,
+      detectionRadius
+    };
+  }
+
+  /**
+   * Проверить обнаружит ли враг игрока на основе освещенности и расстояния
+   * @param enemyPos позиция врага
+   * @param playerPos позиция игрока
+   * @param distance расстояние между врагом и игроком
+   * @returns вероятность обнаружения (0-1)
+   */
+  getEnemyDetectionChance(enemyPos: Point, playerPos: Point, distance: number): number {
+    const playerLighting = this.getLightingInfo(Math.floor(playerPos.x / 32), Math.floor(playerPos.y / 32));
+    const modifier = this.getCombatLightModifier(Math.floor(playerPos.x / 32), Math.floor(playerPos.y / 32));
+    
+    // Базовая вероятность зависит от расстояния
+    const baseChance = Math.max(0, 1 - (distance / modifier.detectionRadius));
+    
+    // Светлость увеличивает вероятность обнаружения
+    const detectionChance = baseChance * (0.3 + playerLighting.lightLevel * 1.4);
+    
+    return Math.min(1, Math.max(0, detectionChance));
+  }
+
+  /**
+   * Получить светлость на позиции для упрощенных проверок
+   */
+  getBrightness(x: number, y: number): number {
+    const lightLevel = this.getLightLevel(x, y);
+    // Нормализовать в диапазон 0-1, где 0 = полная тьма, 1 = полный свет
+    return Math.min(1, Math.max(0, lightLevel));
   }
 
   /**

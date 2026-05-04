@@ -37,7 +37,7 @@ export interface Barrel {
     x: number;
     y: number;
     radius: number;
-    type: ElementType;
+    type: ElementType | 'explosive';
 }
 
 export interface Enemy {
@@ -61,7 +61,7 @@ export interface Enemy {
     barkText: string;
     barkTimer: number;
     alertTimer: number;
-    status: 'wet' | 'oiled' | 'petroleum' | null;
+    status: string | null;
     statusTimer: number;
     angle?: number;
     anim?: AnimatedSprite;

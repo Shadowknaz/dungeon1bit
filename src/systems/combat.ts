@@ -7,12 +7,81 @@ export interface Projectile extends Point {
     radius: number;
 }
 
+/**
+ * Модификаторы боя на основе света
+ */
+export interface LightCombatModifier {
+    accuracyModifier: number;  // Множитель на точность попадания
+    damageModifier: number;    // Множитель на урон
+    detectionChance: number;   // Вероятность обнаружения враг (0-1)
+}
+
 export class CombatSystem {
     constructor(
         private sfx: any,
-        private addFloatingText: (x: number, y: number, text: string, color?: string) => void,
+        private _addFloatingText: (x: number, y: number, text: string, color?: string) => void,
         private makeNoise: (x: number, y: number, radius: number) => void
     ) {}
+
+    /**
+     * Рассчитать модификаторы боя на основе освещенности
+     * @param lightLevel уровень света (0-1)
+     * @returns модификаторы боя
+     */
+    calculateLightModifiers(lightLevel: number): LightCombatModifier {
+        // Точность: в свете лучше видно, поэтому лучше точность
+        // В тени сложнее попасть, но можно скрываться
+        const accuracyModifier = 0.6 + lightLevel * 0.8; // 0.6-1.4 диапазон
+        
+        // Урон в тени немного выше (преимущество скрытности)
+        // Но общий урон в свете может быть немного выше из-за лучшей видимости
+        const damageModifier = 0.95 + (1 - lightLevel) * 0.15; // 0.95-1.1 диапазон, инвертировано для тени
+        
+        // Вероятность обнаружения врагом при стрельбе
+        // В тьме меньше вероятность быть замеченным
+        // На свету высокая вероятность
+        const detectionChance = 0.3 + lightLevel * 0.7; // 0.3-1.0 диапазон
+        
+        return {
+            accuracyModifier,
+            damageModifier,
+            detectionChance
+        };
+    }
+
+    /**
+     * Применить модификаторы света к броску атаки
+     * @param baseAccuracy базовая точность (0-1)
+     * @param lightLevel уровень света
+     * @returns модифицированная точность
+     */
+    applyLightToAccuracy(baseAccuracy: number, lightLevel: number): number {
+        const modifiers = this.calculateLightModifiers(lightLevel);
+        return baseAccuracy * modifiers.accuracyModifier;
+    }
+
+    /**
+     * Применить модификаторы света к урону
+     * @param baseDamage базовый урон
+     * @param lightLevel уровень света
+     * @returns модифицированный урон
+     */
+    applyLightToDamage(baseDamage: number, lightLevel: number): number {
+        const modifiers = this.calculateLightModifiers(lightLevel);
+        return baseDamage * modifiers.damageModifier;
+    }
+
+    /**
+     * Проверить, будет ли враг обнаружен после выстрела
+     * @param lightLevel уровень света
+     * @param randomChance опциональное значение для детерминированного тестирования
+     * @returns true если враг обнаружил игрока
+     */
+    willPlayerBeDetected(lightLevel: number, randomChance?: number): boolean {
+        const modifiers = this.calculateLightModifiers(lightLevel);
+        const roll = randomChance ?? Math.random();
+        return roll < modifiers.detectionChance;
+    }
 
     calculateSpread(baseSpread: number, consecutiveShots: number): number {
         return baseSpread + (consecutiveShots * 0.05);

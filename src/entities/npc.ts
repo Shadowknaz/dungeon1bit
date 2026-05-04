@@ -1,5 +1,3 @@
-import { DialogNode } from './npc';
-
 export interface DialogOption {
     text: string;
     next?: DialogNode;
