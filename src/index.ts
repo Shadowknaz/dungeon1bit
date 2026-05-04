@@ -1543,7 +1543,30 @@ class Game {
         sfx.hit(); 
     }
     
-    private updateUI() { this.ui.update(this.roomLevel, `${this.player.ammo}/${this.player.computedStats.maxAmmo}`, this.player.credits); }
+    private updateUI() { 
+        this.ui.update(this.roomLevel, `${this.player.ammo}/${this.player.computedStats.maxAmmo}`, this.player.credits);
+        
+        // Обновляем HTML HUD элементы
+        const ammoDisplay = document.getElementById('ammoDisplay');
+        const dashDisplay = document.getElementById('dashDisplay');
+        const creditsDisplay = document.getElementById('creditsDisplay');
+        const healthBar = document.getElementById('healthBar');
+        
+        if (ammoDisplay) ammoDisplay.textContent = `${this.player.ammo}/${this.player.computedStats.maxAmmo}`;
+        if (dashDisplay) dashDisplay.textContent = this.player.dashReady ? 'ГОТОВ' : '...';
+        if (creditsDisplay) creditsDisplay.textContent = `$ ${this.player.credits}`;
+        
+        // Обновляем полоску здоровья
+        if (healthBar) {
+            healthBar.innerHTML = '';
+            const maxHealth = 3;
+            for (let i = 0; i < maxHealth; i++) {
+                const pip = document.createElement('div');
+                pip.className = `health-pip${i >= this.currentWill ? ' empty' : ''}`;
+                healthBar.appendChild(pip);
+            }
+        }
+    }
 }
 
 window.onload = () => new Game();
