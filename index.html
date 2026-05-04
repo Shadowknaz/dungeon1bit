@@ -125,16 +125,32 @@
         }
         .hud-label { font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 1px; }
         .hud-value { font-size: 18px; font-weight: bold; color: var(--text-primary); text-shadow: 0 0 5px rgba(255, 255, 255, 0.3); }
-        .health-bar { display: flex; gap: 3px; }
-        .health-pip {
-            width: 16px; height: 16px;
+        .health-bar { display: flex; gap: 4px; }
+        .heart-icon {
+            width: 20px; height: 20px;
             background: var(--border-color);
-            clip-path: polygon(50% 0%, 100% 35%, 82% 100%, 18% 100%, 0% 35%);
-            transition: all 0.2s ease;
+            clip-path: path('M10 18.35l-1.45-1.32C3.4 12.36 0 9.28 0 5.5 0 2.42 2.42 0 5.5 0 7.24 0 8.91.81 10 2.09 11.09.81 12.76 0 14.5 0 17.58 0 20 2.42 20 5.5c0 3.78-3.4 6.86-8.55 11.54L10 18.35z');
+            transition: all 0.3s ease;
+            filter: drop-shadow(0 0 3px rgba(255, 255, 255, 0.5));
         }
-        .health-pip.empty { background: #333; box-shadow: none; }
-        .health-pip:not(.empty) { box-shadow: 0 0 8px rgba(255, 255, 255, 0.6); animation: pulse 2s ease-in-out infinite; }
-        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
+        .heart-icon.empty { 
+            background: #333; 
+            filter: none;
+            transform: scale(0.9);
+        }
+        .heart-icon:not(.empty) { 
+            animation: heartbeat 1.5s ease-in-out infinite;
+            filter: drop-shadow(0 0 8px rgba(255, 100, 100, 0.8));
+        }
+        @keyframes heartbeat { 
+            0%, 100% { transform: scale(1); } 
+            10%, 30% { transform: scale(1.15); } 
+            20%, 40% { transform: scale(1); }
+        }
+        
+        .hud-value.reloading { color: #f55; animation: pulse 0.5s ease-in-out infinite; }
+        .hud-value.ready { color: #5f5; text-shadow: 0 0 8px rgba(100, 255, 100, 0.6); }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         
         .lil-gui { 
             --background-color: #000; --text-color: var(--text-primary); --title-background-color: #222;
@@ -164,23 +180,25 @@
         <div id="hudPanel">
             <div class="hud-section">
                 <div class="hud-item">
-                    <span class="hud-label">HP:</span>
+                    <span class="hud-label">Здоровье:</span>
                     <div class="health-bar" id="healthBar">
-                        <div class="health-pip"></div>
-                        <div class="health-pip"></div>
-                        <div class="health-pip"></div>
+                        <div class="heart-icon"></div>
+                        <div class="heart-icon"></div>
+                        <div class="heart-icon"></div>
+                        <div class="heart-icon"></div>
+                        <div class="heart-icon"></div>
                     </div>
                 </div>
                 <div class="hud-item">
                     <span class="hud-label">Патроны:</span>
                     <span class="hud-value" id="ammoDisplay">6/6</span>
                 </div>
-            </div>
-            <div class="hud-section">
                 <div class="hud-item">
                     <span class="hud-label">Рывок:</span>
-                    <span class="hud-value" id="dashDisplay">ГОТОВ</span>
+                    <span class="hud-value ready" id="dashDisplay">ГОТОВ</span>
                 </div>
+            </div>
+            <div class="hud-section">
                 <div class="hud-item">
                     <span class="hud-label">Кредиты:</span>
                     <span class="hud-value" id="creditsDisplay">$ 0</span>
