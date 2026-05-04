@@ -8,6 +8,30 @@ export interface Point {
     y: number;
 }
 
+export interface Room {
+  id: string;
+  x: number; // global map coordinates
+  y: number;
+  w: number;
+  h: number;
+  map: number[][];
+  doors: Door[];
+  enemies: Enemy[];
+  barrels: Barrel[];
+  chests: Chest[];
+  traps: any[];
+  npcs: NPC[];
+  objects: any[];
+  decorations?: any[]; // декоративные объекты
+}
+
+export interface GameState {
+  currentRoom: Room | null;
+  player: any;
+  frameCount?: number;
+  // другие поля состояния игры
+}
+
 export interface Barrel {
     id: number;
     x: number;

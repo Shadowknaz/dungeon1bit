@@ -1,4 +1,4 @@
-export type ObjectType = 'barrel' | 'chest' | 'trap_spike' | 'trap_plate' | 'npc_civilian';
+export type ObjectType = 'barrel' | 'chest' | 'trap_spike' | 'trap_plate' | 'npc_civilian' | 'torch';
 
 export interface ObjectProperties {
     type: ObjectType;
@@ -37,5 +37,11 @@ export const OBJECTS_DB: Record<ObjectType, ObjectProperties> = {
         name: 'Мирный житель',
         spawnChance: 0.3,
         maxPerRoom: 2
+    },
+    'torch': {
+        type: 'torch',
+        name: 'Факел',
+        spawnChance: 0.8,
+        maxPerRoom: 4
     }
 };
