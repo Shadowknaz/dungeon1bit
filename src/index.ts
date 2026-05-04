@@ -629,6 +629,34 @@ class Game {
                     if (sp) this.npcs.push(createCivilian(sp.x, sp.y));
                 }
             }
+            
+            // Факелы - освещение комнаты
+            const torchProps = OBJECTS_DB['torch'];
+            const torchPositions: {x: number, y: number}[] = [];
+            for (let i = 0; i < torchProps.maxPerRoom; i++) {
+                if (ROT.RNG.getUniform() < torchProps.spawnChance) {
+                    const sp = getSpawn();
+                    if (sp) {
+                        // Проверка расстояния до других факелов (минимум 4 клетки)
+                        const tooClose = torchPositions.some(t => Utils.distSq({x: t.x * TILE_SIZE, y: t.y * TILE_SIZE}, {x: sp.x * TILE_SIZE, y: sp.y * TILE_SIZE}) < 1600);
+                        if (!tooClose) {
+                            torchPositions.push({x: sp.x, y: sp.y});
+                            // Добавляем источник света в систему Lumen
+                            import('./systems/lumen').then(({lumen, LightType}) => {
+                                lumen.addLight({
+                                    id: `torch_${this.frameCounter}_${i}`,
+                                    x: sp.x,
+                                    y: sp.y,
+                                    radius: 6,
+                                    intensity: 0.9,
+                                    type: LightType.STATIC,
+                                    active: true
+                                });
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         this.roomSnapshot = {
