@@ -827,10 +827,28 @@ class Game {
                 }
             }
 
+            // Рывок в направлении движения (WASD) или последнего угла
             if (this.input.keys.Space && this.frameCounter % 60 === 0) {
                 this.player.isDashing = true;
                 this.player.dashTimer = this.player.baseStats.dashDuration;
-                this.player.dashAngle = this.player.angle;
+                
+                // Определяем направление рывка по нажатым клавишам WASD
+                let dashDx = 0, dashDy = 0;
+                if (this.input.keys.KeyW) dashDy -= 1;
+                if (this.input.keys.KeyS) dashDy += 1;
+                if (this.input.keys.KeyA) dashDx -= 1;
+                if (this.input.keys.KeyD) dashDx += 1;
+                
+                // Если нажато направление - используем его, иначе последний угол
+                if (dashDx !== 0 || dashDy !== 0) {
+                    // Нормализуем вектор
+                    const len = Math.sqrt(dashDx * dashDx + dashDy * dashDy);
+                    dashDx /= len;
+                    dashDy /= len;
+                    this.player.dashAngle = Math.atan2(dashDy, dashDx);
+                }
+                // Если направление не задано, используем текущий угол игрока
+                
                 sfx.dash();
                 this.particles.spawn(this.player.x, this.player.y, 5, 1, 3);
             }
@@ -1017,7 +1035,6 @@ class Game {
             this.render.drawDitherOverlay(this.visibleCells, this.dungeon.explored, this.ui.state.seeAllMap);
             
             this.drawCinemaLines();
-            this.drawHUD();
 
             if (this.gameState === 'INVENTORY') this.drawInventory();
             if (this.gameState === 'EXIT_CONFIRM') this.drawExitConfirm();
@@ -1547,23 +1564,35 @@ class Game {
         this.ui.update(this.roomLevel, `${this.player.ammo}/${this.player.computedStats.maxAmmo}`, this.player.credits);
         
         // Обновляем HTML HUD элементы
-        const ammoDisplay = document.getElementById('ammoDisplay');
-        const dashDisplay = document.getElementById('dashDisplay');
         const creditsDisplay = document.getElementById('creditsDisplay');
         const healthBar = document.getElementById('healthBar');
+        const ammoDisplay = document.getElementById('ammoDisplay');
+        const dashDisplay = document.getElementById('dashDisplay');
         
-        if (ammoDisplay) ammoDisplay.textContent = `${this.player.ammo}/${this.player.computedStats.maxAmmo}`;
-        if (dashDisplay) dashDisplay.textContent = this.player.dashReady ? 'ГОТОВ' : '...';
         if (creditsDisplay) creditsDisplay.textContent = `$ ${this.player.credits}`;
         
-        // Обновляем полоску здоровья
+        // Обновляем патроны
+        if (ammoDisplay) {
+            const ammoText = this.player.isReloading ? "ПЕРЕЗАРЯДКА..." : `${this.player.ammo}/${this.player.computedStats.maxAmmo}`;
+            ammoDisplay.textContent = ammoText;
+            ammoDisplay.classList.toggle('reloading', this.player.isReloading);
+        }
+        
+        // Обновляем статус рывка
+        if (dashDisplay) {
+            const dashReady = this.player.dashTimer <= 0 || !this.player.isDashing;
+            dashDisplay.textContent = dashReady ? "ГОТОВ" : "НЕТ";
+            dashDisplay.classList.toggle('ready', dashReady);
+        }
+        
+        // Обновляем иконки сердец (5 максимум)
         if (healthBar) {
             healthBar.innerHTML = '';
-            const maxHealth = 3;
+            const maxHealth = 5;
             for (let i = 0; i < maxHealth; i++) {
-                const pip = document.createElement('div');
-                pip.className = `health-pip${i >= this.currentWill ? ' empty' : ''}`;
-                healthBar.appendChild(pip);
+                const heart = document.createElement('div');
+                heart.className = `heart-icon${i >= this.currentWill ? ' empty' : ''}`;
+                healthBar.appendChild(heart);
             }
         }
     }
