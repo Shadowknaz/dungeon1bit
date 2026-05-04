@@ -21,18 +21,28 @@ export class RenderSystem {
     }
 
     private initDither() {
+        // Улучшенный паттерн дизеринга с более плавным переходом
         const ditherCanvas = document.createElement('canvas');
         ditherCanvas.width = 4;
         ditherCanvas.height = 4;
         const dCtx = ditherCanvas.getContext('2d', { alpha: false })!;
-        dCtx.fillStyle = '#000'; dCtx.fillRect(0, 0, 4, 4);
-        dCtx.fillStyle = '#fff'; dCtx.fillRect(0, 0, 2, 2); dCtx.fillRect(2, 2, 2, 2);
+        dCtx.fillStyle = '#000'; 
+        dCtx.fillRect(0, 0, 4, 4);
+        
+        // Более мягкий паттерн для лучшей видимости
+        dCtx.fillStyle = '#333'; 
+        dCtx.fillRect(0, 0, 1, 1); 
+        dCtx.fillRect(2, 1, 1, 1);
+        dCtx.fillRect(1, 2, 1, 1); 
+        dCtx.fillRect(3, 2, 1, 1);
+        dCtx.fillRect(0, 3, 1, 1); 
+        dCtx.fillRect(2, 3, 1, 1);
 
         const ditherPatternCanvas = document.createElement('canvas');
         ditherPatternCanvas.width = 4;
         ditherPatternCanvas.height = 4;
         const dpCtx = ditherPatternCanvas.getContext('2d')!;
-        dpCtx.globalAlpha = 0.25;
+        dpCtx.globalAlpha = 0.3;
         dpCtx.drawImage(ditherCanvas, 0, 0);
         this.ditherPattern = this.ctx.createPattern(ditherPatternCanvas, 'repeat');
     }
@@ -78,7 +88,11 @@ export class RenderSystem {
     }
 
     public drawShadow(x: number, y: number, radius: number) {
-        this.ctx.fillStyle = '#000000';
+        // Градиентная тень для большей глубины
+        const gradient = this.ctx.createRadialGradient(x, y + radius * 0.3, 0, x, y + radius * 0.5, radius);
+        gradient.addColorStop(0, 'rgba(0, 0, 0, 0.4)');
+        gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        this.ctx.fillStyle = gradient;
         this.ctx.beginPath();
         this.ctx.ellipse(x, y + radius * 0.5, radius, radius * 0.4, 0, 0, Math.PI * 2);
         this.ctx.fill();
@@ -87,11 +101,19 @@ export class RenderSystem {
     public drawText1bit(text: string, x: number, y: number, fg = '#fff', outline = '#000') {
         this.ctx.miterLimit = 2;
         this.ctx.lineJoin = 'round';
+        
+        // Добавляем свечение для текста
+        this.ctx.shadowColor = fg;
+        this.ctx.shadowBlur = 8;
+        
         this.ctx.strokeStyle = outline;
         this.ctx.lineWidth = 3;
         this.ctx.strokeText(text, x, y);
         this.ctx.fillStyle = fg;
         this.ctx.fillText(text, x, y);
+        
+        // Сбрасываем тень
+        this.ctx.shadowBlur = 0;
     }
 
     public clear() {
@@ -100,7 +122,12 @@ export class RenderSystem {
     }
 
     public drawStaticLayer() {
+        // Добавляем легкое свечение для статического слоя
+        this.ctx.save();
+        this.ctx.shadowColor = 'rgba(255, 255, 255, 0.1)';
+        this.ctx.shadowBlur = 10;
         this.ctx.drawImage(this.staticCanvas, 0, 0);
+        this.ctx.restore();
     }
 
     public drawDitherOverlay(visibleCells: Record<string, boolean>, explored: boolean[][], seeAllMap: boolean) {

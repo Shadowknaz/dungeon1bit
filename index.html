@@ -7,55 +7,185 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.min.css">
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg-color: #0a0a0a;
+            --panel-bg: #111;
+            --border-color: #fff;
+            --text-primary: #fff;
+            --text-secondary: #aaa;
+            --accent-glow: rgba(255, 255, 255, 0.15);
+        }
+        
         body {
-            margin: 0; padding: 0; background-color: #000; color: #fff;
-            font-family: 'IBM Plex Mono', 'Consolas', monospace; overflow: hidden;
-            display: flex; justify-content: center; align-items: center; height: 100vh;
+            margin: 0; padding: 0; 
+            background: radial-gradient(ellipse at center, #1a1a1a 0%, #000 100%);
+            color: var(--text-primary);
+            font-family: 'IBM Plex Mono', 'Consolas', monospace; 
+            overflow: hidden; 
+            display: flex; 
+            flex-direction: column;
+            justify-content: center; 
+            align-items: center; 
+            height: 100vh;
+            user-select: none;
         }
+        
         #gameWrapper { 
-            display: flex; gap: 20px; align-items: flex-start; 
+            display: flex; 
+            flex-direction: column;
+            gap: 15px; 
+            align-items: center;
             transform-origin: center center;
+            padding: 20px;
         }
+        
+        #gameContainer {
+            position: relative;
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+        }
+        
         #gameCanvas {
-            background-color: #000; border: 2px solid #fff;
-            box-shadow: 0 0 20px rgba(255, 255, 255, 0.1); cursor: crosshair;
+            background-color: #000; 
+            border: 3px solid var(--border-color);
+            box-shadow: 
+                0 0 30px var(--accent-glow),
+                inset 0 0 60px rgba(0, 0, 0, 0.5);
+            cursor: crosshair;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
         }
+        
         .crt::before {
-            content: " "; display: block; position: absolute;
+            content: " "; 
+            display: block; 
+            position: absolute;
             top: 0; left: 0; bottom: 0; right: 0;
-            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
-            z-index: 2; background-size: 100% 2px, 3px 100%; pointer-events: none;
+            background: 
+                linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.15) 50%),
+                linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            z-index: 10; 
+            background-size: 100% 3px, 4px 100%; 
+            pointer-events: none;
+            mix-blend-mode: overlay;
         }
+        
+        .crt::after {
+            content: " ";
+            display: block;
+            position: absolute;
+            top: 0; left: 0; bottom: 0; right: 0;
+            background: radial-gradient(ellipse at center, transparent 50%, rgba(0, 0, 0, 0.4) 100%);
+            z-index: 11;
+            pointer-events: none;
+        }
+        
         #sidePanel {
-            width: 300px; height: 600px; border: 2px solid #fff; background-color: #000;
-            box-sizing: border-box; padding: 20px; display: flex; flex-direction: column; z-index: 10;
+            width: 280px; 
+            min-height: 600px; 
+            border: 2px solid var(--border-color); 
+            background: linear-gradient(180deg, var(--panel-bg) 0%, #0a0a0a 100%);
+            box-sizing: border-box; 
+            padding: 20px; 
+            display: flex; 
+            flex-direction: column; 
+            z-index: 10;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
         }
+        
         #nodeInfo { flex-grow: 1; display: none; }
-        #nodeInfo h2 { margin-top: 0; font-size: 24px; border-bottom: 2px solid #fff; padding-bottom: 10px; text-transform: uppercase; }
-        #nodeInfo p { font-size: 16px; line-height: 1.5; color: #ccc; }
-        #niStatus { margin-top: 20px; font-weight: bold; font-size: 18px; }
-        .blink { animation: blink 1s step-end infinite; color: #fff; }
+        #nodeInfo h2 { margin-top: 0; font-size: 20px; border-bottom: 2px solid var(--border-color); padding-bottom: 10px; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 10px rgba(255, 255, 255, 0.5); }
+        #nodeInfo p { font-size: 14px; line-height: 1.6; color: var(--text-secondary); }
+        #niStatus { margin-top: 20px; font-weight: bold; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; }
+        .blink { animation: blink 1s step-end infinite; color: var(--text-primary); }
         @keyframes blink { 50% { opacity: 0; } }
         #guiContainer { margin-top: auto; }
-
-        /* Встроенные стили lil-gui для обхода блокировок CDN */
-        .lil-gui { 
-            --background-color: #000; --text-color: #fff; --title-background-color: #222;
-            --widget-color: #333; --hover-color: #555; --focus-color: #fff;
-            --number-color: #fff; --string-color: #fff; --font-family: 'IBM Plex Mono', 'Consolas', monospace;
-            border: 2px solid #fff; position: static !important; width: 100% !important;
+        
+        #hudPanel {
+            width: 100%;
+            max-width: 800px;
+            border: 2px solid var(--border-color);
+            background: linear-gradient(180deg, var(--panel-bg) 0%, #0a0a0a 100%);
+            padding: 15px 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+            box-sizing: border-box;
         }
-        .lil-gui .title { background: var(--title-background-color); padding: 5px; font-weight: bold; }
+        
+        .hud-section { display: flex; align-items: center; gap: 20px; }
+        .hud-item {
+            display: flex; align-items: center; gap: 8px;
+            padding: 5px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 2px;
+        }
+        .hud-label { font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 1px; }
+        .hud-value { font-size: 18px; font-weight: bold; color: var(--text-primary); text-shadow: 0 0 5px rgba(255, 255, 255, 0.3); }
+        .health-bar { display: flex; gap: 3px; }
+        .health-pip {
+            width: 16px; height: 16px;
+            background: var(--border-color);
+            clip-path: polygon(50% 0%, 100% 35%, 82% 100%, 18% 100%, 0% 35%);
+            transition: all 0.2s ease;
+        }
+        .health-pip.empty { background: #333; box-shadow: none; }
+        .health-pip:not(.empty) { box-shadow: 0 0 8px rgba(255, 255, 255, 0.6); animation: pulse 2s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
+        
+        .lil-gui { 
+            --background-color: #000; --text-color: var(--text-primary); --title-background-color: #222;
+            --widget-color: #333; --hover-color: #555; --focus-color: var(--border-color);
+            --number-color: var(--text-primary); --string-color: var(--text-primary);
+            --font-family: 'IBM Plex Mono', 'Consolas', monospace;
+            border: 1px solid rgba(255, 255, 255, 0.3); position: static !important; width: 100% !important;
+        }
+        .lil-gui .title { background: var(--title-background-color); padding: 8px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 12px; }
+        
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+        .hud-item { animation: fadeIn 0.3s ease-out forwards; }
     </style>
 </head>
 <body class="crt">
     <div id="gameWrapper">
-        <canvas id="gameCanvas" width="800" height="600"></canvas>
-        <div id="sidePanel">
-            <div id="nodeInfo">
-                <h2 id="niTitle">УЗЕЛ</h2><p id="niDesc"></p><div id="niStatus"></div>
+        <div id="gameContainer">
+            <canvas id="gameCanvas" width="800" height="600"></canvas>
+            <div id="sidePanel">
+                <div id="nodeInfo">
+                    <h2 id="niTitle">УЗЕЛ</h2><p id="niDesc"></p><div id="niStatus"></div>
+                </div>
+                <div id="guiContainer"></div>
             </div>
-            <div id="guiContainer"></div>
+        </div>
+        
+        <div id="hudPanel">
+            <div class="hud-section">
+                <div class="hud-item">
+                    <span class="hud-label">HP:</span>
+                    <div class="health-bar" id="healthBar">
+                        <div class="health-pip"></div>
+                        <div class="health-pip"></div>
+                        <div class="health-pip"></div>
+                    </div>
+                </div>
+                <div class="hud-item">
+                    <span class="hud-label">Патроны:</span>
+                    <span class="hud-value" id="ammoDisplay">6/6</span>
+                </div>
+            </div>
+            <div class="hud-section">
+                <div class="hud-item">
+                    <span class="hud-label">Рывок:</span>
+                    <span class="hud-value" id="dashDisplay">ГОТОВ</span>
+                </div>
+                <div class="hud-item">
+                    <span class="hud-label">Кредиты:</span>
+                    <span class="hud-value" id="creditsDisplay">$ 0</span>
+                </div>
+            </div>
         </div>
     </div>
     <script type="module" src="/src/index.ts"></script>
