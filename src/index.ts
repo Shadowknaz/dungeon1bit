@@ -16,12 +16,15 @@ import { Utils, resolveCollision } from './systems/physics';
 import { ParticleSystem } from './systems/particles';
 import { FluidSystem } from './systems/fluids';
 import { TrapSystem, TrapState } from './systems/traps';
-import { enemyMachineDef, EnemyActions, calculateEnemyDetectionChance, EnemyDetectionParams } from './systems/ai';
+import { enemyMachineDef, EnemyActions, checkVisionCone } from './systems/ai';
+import { updateMemory, decrementMemoryTimer, hasValidMemory, updateNoise, decayNoise, clearMemory } from './systems/memory';
 import { generateGlobalMap, GlobalMap } from './systems/mapGenerator';
 import { InventorySystem, ItemInstance } from './systems/inventory';
-import { CombatSystem, Projectile } from './systems/combat';
+import { CombatSystem } from './systems/combat';
 import { DungeonSystem } from './systems/dungeon';
 import { lumen, LightType } from './systems/lumen';
+import { OverlaySystem } from './systems/overlay';
+import { SpawnManager } from './systems/spawnManager';
 
 // Entities
 import { createPlayer, PlayerState } from './entities/player';
@@ -30,13 +33,19 @@ import { ITEMS_DB } from './data/items';
 import { ENEMIES_DB } from './data/enemies';
 import { ELEMENTS_DB, ElementType } from './data/elements';
 import { OBJECTS_DB } from './data/objects';
+import { generateBossArena, generateMerchantRoom } from './data/typeNode';
 
 // UI
 import { RenderSystem } from './ui/render';
 import { InterfaceSystem } from './ui/interface';
 
 // Types
-import { Enemy, NPC, Barrel, Chest, Door, Point, PressurePlate } from './types';
+import { Enemy, NPC, Barrel, Chest, Door, Point, PressurePlate, Torch, Projectile } from './types';
+import { Position, Velocity, Health, Sprite, PlayerTag, EnemyTag, NpcTag } from './components';
+
+const playerQuery = bitECS.defineQuery([PlayerTag, Position, Health]);
+const enemyQuery = bitECS.defineQuery([EnemyTag, Position, Health]);
+const npcQuery = bitECS.defineQuery([NpcTag, Position]);
 
 class Game {
     private canvas: HTMLCanvasElement;
@@ -54,6 +63,7 @@ class Game {
     private inventory = new InventorySystem(8, 6);
     private combat: CombatSystem;
     private traps: TrapSystem;
+    private overlay = new OverlaySystem();
     
     private player!: PlayerState;
     private gameState: 'GLOBAL_MAP' | 'PLAYING' | 'INVENTORY' | 'DIALOG' | 'GAME_OVER' | 'VICTORY' | 'EXIT_CONFIRM' | 'CHEST' = 'GLOBAL_MAP';
@@ -62,10 +72,11 @@ class Game {
     private selectedNodeId: number | null = null;
     private hoveredNodeId: number | null = null;
     
-    private enemies: Enemy[] = [];
-    private npcs: NPC[] = [];
+    private enemiesMap = new Map<number, Enemy>();
+    private npcsMap = new Map<number, NPC>();
     private trapState: TrapState = { pits: [], spikes: [], blades: [], plates: [], mines: [], mirrors: [] };
     private barrels: Barrel[] = [];
+    private torches: Torch[] = [];
     private floatingTexts: any[] = [];
     private bullets: Projectile[] = [];
     private currentWill = 5;
@@ -87,6 +98,8 @@ class Game {
     private doors: Door[] = [];
     private roomSnapshot: any = null;
     private isRestarting = false;
+    private deathAnimTimer = 0;
+    private isDead = false;
     private static readonly PLAYER_LIGHT_ID = 'player_light';
 
     private draggingItem: any = null;
@@ -95,6 +108,7 @@ class Game {
     private selectedItemInstanceId: number | null = null;
     private uiAnimProgress = 0;
     private activeChest: Chest | null = null;
+    private animationFrameId: number | null = null;
 
     constructor() {
         this.canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
@@ -118,7 +132,13 @@ class Game {
         
         window.addEventListener('keydown', (e: KeyboardEvent) => {
             if (e.code === 'Tab') { e.preventDefault(); this.toggleInventory(); }
-            if (e.code === 'KeyR') this.reload();
+            if (e.code === 'KeyR') {
+                if (this.isDead) {
+                    this.triggerRestartAnimation();
+                } else {
+                    this.reload();
+                }
+            }
             if (e.code === 'KeyE') this.interact();
         });
 
@@ -133,28 +153,47 @@ class Game {
     private interact() {
         if (this.gameState !== 'PLAYING') return;
 
-        // 1. Drop barrel
+        // 1. Drop barrel - place one cell ahead in facing direction
         if (this.player.carryingBarrel) {
-            let px = Math.floor(this.player.x / TILE_SIZE);
-            let py = Math.floor(this.player.y / TILE_SIZE);
-            if (this.isPassable(px, py)) {
-                let type = this.player.carryingBarrel as any;
-                let newBrl: Barrel = { id: Math.random(), x: this.player.x, y: this.player.y, radius: 10, type };
-                this.barrels.push(newBrl);
-                this.player.carryingBarrel = null;
-                sfx.click();
-                
-                const grid = this.fluids.getGrid();
-                const cell = grid[px]?.[py];
-                if (cell && (cell.type === 'oil' || cell.type === 'petroleum') && cell.fire === 0) {
-                    this.fluids.ignite(px, py);
-                    this.makeNoise(this.player.x, this.player.y, 400);
-                } else if (cell && cell.fire > 0) {
-                    setTimeout(() => {
-                        const idx = this.barrels.indexOf(newBrl);
-                        if (idx > -1) this.destroyBarrel(idx);
-                    }, 500);
-                }
+            // Calculate cell ahead based on player angle
+            const aheadGx = Math.floor((this.player.x + Math.cos(this.player.angle) * TILE_SIZE) / TILE_SIZE);
+            const aheadGy = Math.floor((this.player.y + Math.sin(this.player.angle) * TILE_SIZE) / TILE_SIZE);
+
+            // Validation: check if passable (not wall)
+            if (!this.isPassable(aheadGx, aheadGy)) {
+                this.addFloatingText(this.player.x, this.player.y - 30, "ЗАБЛОКИРОВАНО!", '#f88');
+                return;
+            }
+
+            // Validation: check for pits
+            const aheadWorldX = aheadGx * TILE_SIZE + TILE_SIZE / 2;
+            const aheadWorldY = aheadGy * TILE_SIZE + TILE_SIZE / 2;
+            const isPit = this.trapState.pits.some(p => Utils.dist({x: aheadWorldX, y: aheadWorldY}, p) < TILE_SIZE * 0.5);
+            if (isPit) {
+                this.addFloatingText(this.player.x, this.player.y - 30, "ЯМА!", '#f88');
+                return;
+            }
+
+            let type = this.player.carryingBarrel as any;
+            const barrelId = Math.random();
+            let newBrl: Barrel = { id: barrelId, x: aheadWorldX, y: aheadWorldY, radius: 10, type };
+            this.barrels.push(newBrl);
+            // Add barrel as obstacle
+            this.obstacles.push({ x: aheadWorldX - 10, y: aheadWorldY - 10, w: 20, h: 20, type: 'barrel', id: barrelId });
+            this.player.carryingBarrel = null;
+            sfx.click();
+
+            // Check fluid interactions at barrel position
+            const grid = this.fluids.getGrid();
+            const cell = grid[aheadGx]?.[aheadGy];
+            if (cell && (cell.type === 'oil' || cell.type === 'petroleum') && cell.fire === 0) {
+                this.fluids.ignite(aheadGx, aheadGy);
+                this.makeNoise(aheadWorldX, aheadWorldY, 400);
+            } else if (cell && cell.fire > 0) {
+                setTimeout(() => {
+                    const idx = this.barrels.indexOf(newBrl);
+                    if (idx > -1) this.destroyBarrel(idx);
+                }, 500);
             }
             return;
         }
@@ -162,17 +201,30 @@ class Game {
         // 2. Pick up barrel
         const nearBarrelIdx = this.barrels.findIndex(b => Utils.dist(this.player, b) < 30);
         if (nearBarrelIdx !== -1) {
-            this.player.carryingBarrel = this.barrels[nearBarrelIdx].type;
+            const barrel = this.barrels[nearBarrelIdx];
+            this.player.carryingBarrel = barrel.type;
+            // Remove from obstacles
+            this.obstacles = this.obstacles.filter(o => !(o.type === 'barrel' && o.id === barrel.id));
             this.barrels.splice(nearBarrelIdx, 1);
             sfx.click();
             return;
         }
 
         // 3. Near NPC
-        const nearNPC = this.npcs.find(n => Utils.dist(this.player, n) < 40);
+        const npcs = npcQuery(this.world);
+        let nearNPC: any = null;
+        for (let i = 0; i < npcs.length; i++) {
+            const eid = npcs[i];
+            const npc = this.npcsMap.get(eid)!;
+            if (Utils.dist({x: Position.x[this.player.eid], y: Position.y[this.player.eid]}, {x: Position.x[eid], y: Position.y[eid]}) < 40) {
+                nearNPC = npc;
+                break;
+            }
+        }
+
         if (nearNPC) {
             this.activeNPC = nearNPC;
-            if (!this.activeNPC.currentNode) this.activeNPC.currentNode = this.activeNPC.dialogTree;
+            if (!this.activeNPC!.currentNode) this.activeNPC!.currentNode = this.activeNPC!.dialogTree;
             this.gameState = 'DIALOG';
             return;
         }
@@ -184,6 +236,21 @@ class Game {
             this.gameState = 'CHEST';
             this.uiAnimProgress = 0;
             sfx.chestOpen();
+            return;
+        }
+
+        // 5. Near Torch - toggle on/off
+        const nearTorchIdx = this.torches.findIndex(t => Utils.dist(this.player, {x: t.x, y: t.y}) < 40);
+        if (nearTorchIdx !== -1) {
+            const torch = this.torches[nearTorchIdx];
+            const isNowLit = lumen.toggleLight(torch.id);
+            torch.lit = isNowLit;
+            if (isNowLit) {
+                this.addFloatingText(torch.x, torch.y - 20, "ФАКЕЛ ЗАЖЖЁН", '#fa0');
+            } else {
+                this.addFloatingText(torch.x, torch.y - 20, "ФАКЕЛ ПОТУШЕН", '#888');
+            }
+            sfx.click();
             return;
         }
     }
@@ -203,9 +270,6 @@ class Game {
                 this.addFloatingText(this.player.x, this.player.y - 20, "НЕТ МЕСТА!", '#f00');
                 break;
             }
-        }
-        if (this.activeChest.items.length === 0) {
-            this.activeChest.opened = true;
         }
         sfx.click();
         this.updateUI();
@@ -249,24 +313,26 @@ class Game {
             } else this.selectedNodeId = null;
             this.updateSidePanel();
         } else if (this.gameState === 'INVENTORY' || this.gameState === 'CHEST') {
-            const gridX = (GAME_WIDTH - 8 * 30) / 2;
-            const gridY = (GAME_HEIGHT - 6 * 30) / 2 + (this.gameState === 'CHEST' ? 60 : 0);
+            // Horizontal layout: Chest left, Inventory right
+            const chestX = this.gameState === 'CHEST' ? (GAME_WIDTH / 2 - 320) : 0;
+            const invX = GAME_WIDTH / 2 + 20;
+            const gridY = (GAME_HEIGHT - 6 * 30) / 2;
             
-            // Check Inventory
-            const foundInv = this.inventory.getItemAtPixel(mouse.x, mouse.y, gridX, gridY, 30, this.inventoryItems);
+            // Check Inventory (right side)
+            const foundInv = this.inventory.getItemAtPixel(mouse.x, mouse.y, invX, gridY, 30, this.inventoryItems);
             if (foundInv) {
                 this.draggingItem = foundInv.item;
                 this.draggingItemSource = 'inventory';
                 this.selectedItemInstanceId = foundInv.item.instanceId;
-                this.dragOffset = { x: mouse.x - (gridX + foundInv.item.x * 30), y: mouse.y - (gridY + foundInv.item.y * 30) };
+                this.dragOffset = { x: mouse.x - (invX + foundInv.item.x * 30), y: mouse.y - (gridY + foundInv.item.y * 30) };
                 sfx.click();
                 return;
             }
 
-            // Check Chest
+            // Check Chest (left side)
             if (this.gameState === 'CHEST' && this.activeChest) {
-                const cGridX = (GAME_WIDTH - 8 * 30) / 2;
-                const cGridY = (GAME_HEIGHT - 6 * 30) / 2 - 140;
+                const cGridX = chestX;
+                const cGridY = gridY;
                 const foundChest = this.inventory.getItemAtPixel(mouse.x, mouse.y, cGridX, cGridY, 30, this.activeChest.items);
                 if (foundChest) {
                     this.draggingItem = foundChest.item;
@@ -277,19 +343,21 @@ class Game {
                     return;
                 }
 
-                // Buttons
-                if (mouse.y > cGridY + 6 * 30 + 10 && mouse.y < cGridY + 6 * 30 + 40) {
-                    if (mouse.x > cGridX && mouse.x < cGridX + 120) { this.takeAll(); return; }
-                    if (mouse.x > cGridX + 130 && mouse.x < cGridX + 240) { this.toggleInventory(); return; }
+                // Close Chest Button
+                if (mouse.y > gridY + 6 * 30 + 10 && mouse.y < gridY + 6 * 30 + 40 && mouse.x > chestX + 70 && mouse.x < chestX + 190) {
+                    this.gameState = 'PLAYING';
+                    this.activeChest = null;
+                    sfx.click();
+                    return;
                 }
             }
 
-            // Inventory Buttons (Equip/Destroy)
-            if (this.selectedItemInstanceId && this.draggingItemSource === 'inventory') {
+            // Inventory Buttons (Equip/Destroy) - right side
+            if (this.selectedItemInstanceId) {
                 const item = this.inventoryItems.find(it => it.instanceId === this.selectedItemInstanceId);
                 const db = item ? ITEMS_DB[item.id] : null;
                 if (db) {
-                    const bx = gridX + 8 * 30 + 20;
+                    const bx = invX + 8 * 30 + 20;
                     const by = gridY;
                     if (db.type === 'weapon' && mouse.x > bx && mouse.x < bx + 100 && mouse.y > by && mouse.y < by + 30) {
                         if (this.player.equippedWeaponInstanceId === item!.instanceId) this.player.equippedWeaponInstanceId = null;
@@ -369,16 +437,15 @@ class Game {
     private handleMouseUp(e: MouseEvent) {
         if ((this.gameState === 'INVENTORY' || this.gameState === 'CHEST') && this.draggingItem) {
             const mouse = this.input.mouse;
-            const gridX = (GAME_WIDTH - 8 * 30) / 2;
-            const gridY = (GAME_HEIGHT - 6 * 30) / 2 + (this.gameState === 'CHEST' ? 60 : 0);
-            
-            const cGridX = (GAME_WIDTH - 8 * 30) / 2;
-            const cGridY = (GAME_HEIGHT - 6 * 30) / 2 - 140;
+            // Horizontal layout: Chest left, Inventory right
+            const chestX = this.gameState === 'CHEST' ? (GAME_WIDTH / 2 - 320) : 0;
+            const invX = GAME_WIDTH / 2 + 20;
+            const gridY = (GAME_HEIGHT - 6 * 30) / 2;
 
             let placed = false;
 
-            // Try place in Inventory
-            const invGX = Math.round((mouse.x - this.dragOffset.x - gridX) / 30);
+            // Try place in Inventory (right side)
+            const invGX = Math.round((mouse.x - this.dragOffset.x - invX) / 30);
             const invGY = Math.round((mouse.y - this.dragOffset.y - gridY) / 30);
             if (this.inventory.canPlaceItem(this.draggingItem, invGX, invGY, this.inventoryItems)) {
                 if (this.draggingItemSource === 'chest' && this.activeChest) {
@@ -390,10 +457,10 @@ class Game {
                 placed = true;
                 sfx.click();
             } 
-            // Try place in Chest
+            // Try place in Chest (left side)
             else if (this.gameState === 'CHEST' && this.activeChest) {
-                const chestGX = Math.round((mouse.x - this.dragOffset.x - cGridX) / 30);
-                const chestGY = Math.round((mouse.y - this.dragOffset.y - cGridY) / 30);
+                const chestGX = Math.round((mouse.x - this.dragOffset.x - chestX) / 30);
+                const chestGY = Math.round((mouse.y - this.dragOffset.y - gridY) / 30);
                 if (this.inventory.canPlaceItem(this.draggingItem, chestGX, chestGY, this.activeChest.items)) {
                     if (this.draggingItemSource === 'inventory') {
                         this.inventoryItems = this.inventoryItems.filter(it => it !== this.draggingItem);
@@ -459,11 +526,17 @@ class Game {
     }
 
     private init() {
+        // Cancel any existing game loop to prevent multiple loops running
+        if (this.animationFrameId !== null) {
+            cancelAnimationFrame(this.animationFrameId);
+            this.animationFrameId = null;
+        }
+        
         ROT.RNG.setSeed(Date.now());
         lumen.init(MAP_COLS, MAP_ROWS);
         lumen.reset();
         this.world = bitECS.createWorld();
-        this.player = createPlayer(bitECS.addEntity(this.world));
+        this.player = createPlayer(this.world, bitECS.addEntity(this.world));
         this.globalMap = generateGlobalMap(ROT.RNG);
         this.gameState = 'GLOBAL_MAP';
         this.roomLevel = 1;
@@ -483,9 +556,16 @@ class Game {
     }
 
     private generateRoom() {
-        this.bullets = []; this.enemies = []; this.npcs = []; this.trapState = { pits: [], spikes: [], blades: [], plates: [], mines: [], mirrors: [] };
+        this.bullets = []; this.enemiesMap.clear(); this.npcsMap.clear(); this.trapState = { pits: [], spikes: [], blades: [], plates: [], mines: [], mirrors: [] };
+        // Cleanup old bitECS entities except player
+        const entities = bitECS.getAllEntities(this.world);
+        for (const eid of entities) {
+            if (!bitECS.hasComponent(this.world, PlayerTag, eid)) {
+                bitECS.removeEntity(this.world, eid);
+            }
+        }
         this.obstacles = []; this.floatingTexts = []; this.chests = []; this.doors = [];
-        this.barrels = []; this.fluids.reset();
+        this.barrels = []; this.torches = []; this.fluids.reset();
         this.secretRoomOpen = false; this.secretDoors = []; this.secretDoorObstacles = []; this.secretRoomCells = [];
         this.roomActive = false; this.combatIntensity = 0; this.gameState = 'PLAYING'; 
         this.player.x = GAME_WIDTH / 2; this.player.y = 520; this.player.trail = []; this.player.carryingBarrel = null;
@@ -496,18 +576,35 @@ class Game {
         
         if (node.type === 'merchant' || node.type === 'shrine') {
             this.dungeon.reset();
-            let cx = Math.floor(MAP_COLS/2), cy = 10; 
-            for(let x = cx - 5; x <= cx + 5; x++) for(let y = cy - 5; y <= cy + 5; y++) this.dungeon.grid[x][y] = 0;
-            for(let y = cy + 5; y < 22; y++) { this.dungeon.grid[cx][y] = 0; this.dungeon.grid[cx-1][y] = 0; this.dungeon.grid[cx+1][y] = 0; }
-            for (let x = 16; x <= 23; x++) for (let y = 19; y < 22; y++) this.dungeon.grid[x][y] = 0;
-            for (let x = 0; x < MAP_COLS; x++) for (let y = 22; y < MAP_ROWS; y++) this.dungeon.grid[x][y] = (x >= 17 && x <= 22) ? 0 : 1;
-            
-            this.startDoor = { x: 340, y: 440, w: 120, h: 20, open: false, type: 'start' };
-            this.exitRoomCenter = { x: cx * TILE_SIZE, y: (cy - 5) * TILE_SIZE };
-            
-            if (node.type === 'merchant') this.npcs.push(createMerchant(cx*TILE_SIZE, cy*TILE_SIZE));
-            else this.npcs.push(createAltar(cx*TILE_SIZE, cy*TILE_SIZE));
-            this.npcs.push(createCivilian(cx*TILE_SIZE - 40, cy*TILE_SIZE + 40));
+            const result = generateMerchantRoom();
+            this.dungeon.grid = result.grid;
+
+            this.startDoor = result.startDoor;
+            this.exitRoomCenter = result.exitRoomCenter;
+
+            // Очищаем и декорируем overlay систему
+            this.overlay.clear();
+            this.overlay.decorateRoom(result.floorTiles, 0.05);
+
+            const cx = Math.floor(MAP_COLS / 2);
+            const cy = 10;
+            if (node.type === 'merchant') this.spawnNPC('merchant', cx*TILE_SIZE, cy*TILE_SIZE);
+            else this.spawnNPC('shrine', cx*TILE_SIZE, cy*TILE_SIZE);
+            this.spawnNPC('civilian', cx*TILE_SIZE - 40, cy*TILE_SIZE + 40);
+        } else if (node.type === 'boss') {
+            this.dungeon.reset();
+            const result = generateBossArena();
+            this.dungeon.grid = result.grid;
+
+            this.startDoor = result.startDoor;
+            this.exitRoomCenter = result.exitRoomCenter;
+
+            // Очищаем и декорируем overlay систему
+            this.overlay.clear();
+            this.overlay.decorateRoom(result.floorTiles, 0.03);
+
+            // TODO: Здесь будет спавн босса
+            // Пока без босса, только арена
         } else {
             const rooms = this.dungeon.generate({ roomWidth: [4, 8], roomHeight: [4, 8], corridorLength: [2, 5], dugPercentage: 0.3 });
             const closest = this.dungeon.getClosestRoom(rooms, MAP_COLS / 2, 22);
@@ -524,27 +621,110 @@ class Game {
             const topRoom = this.dungeon.getTopRoom(rooms);
             this.exitRoomCenter = { x: topRoom.getCenter()[0] * TILE_SIZE, y: topRoom.getCenter()[1] * TILE_SIZE };
 
-            // Secret Rooms
+            // Очищаем и декорируем overlay систему для подземелья
+            this.overlay.clear();
+            const floorTiles: {x: number, y: number}[] = [];
+            for (let x = 0; x < MAP_COLS; x++) {
+                for (let y = 0; y < MAP_ROWS; y++) {
+                    if (this.dungeon.grid[x][y] === 0) floorTiles.push({x, y});
+                }
+            }
+            this.overlay.decorateRoom(floorTiles, 0.08);
+
+            // Secret Rooms - 40% chance if dead-end room exists
+            const SECRET_ROOM_CHANCE = 0.4;
             const deadEndRooms = rooms.filter(r => {
                 if (r === topRoom || r === closest.room) return false;
                 let count = 0; r.getDoors(() => count++);
                 return count === 1;
             });
 
-            if (deadEndRooms.length > 0) {
+            if (deadEndRooms.length > 0 && ROT.RNG.getUniform() < SECRET_ROOM_CHANCE) {
                 const secretRoom = deadEndRooms[Math.floor(Math.random() * deadEndRooms.length)];
-                for (let x = secretRoom.getLeft(); x <= secretRoom.getRight(); x++) 
-                    for (let y = secretRoom.getTop(); y <= secretRoom.getBottom(); y++) 
+                for (let x = secretRoom.getLeft(); x <= secretRoom.getRight(); x++)
+                    for (let y = secretRoom.getTop(); y <= secretRoom.getBottom(); y++)
                         this.secretRoomCells.push({gx: x, gy: y});
-                
+
                 secretRoom.getDoors((x, y) => {
                     this.secretDoors.push({x, y});
                     this.dungeon.grid[x][y] = 1;
                     this.secretDoorObstacles.push({ x: x * TILE_SIZE, y: y * TILE_SIZE, w: TILE_SIZE, h: TILE_SIZE });
-                    
-                    // Spawn pressure plate nearby
-                    this.trapState.plates.push({ id: `plate_${Math.random()}`, x: (x + 1) * TILE_SIZE, y: y * TILE_SIZE, pressed: false, timer: 0, discovered: false });
                 });
+
+                // Spawn pressure plate OUTSIDE the secret room (in adjacent area)
+                // Find empty cells adjacent to secret room (not inside)
+                const adjacentCells: any[] = [];
+                for (let x = secretRoom.getLeft() - 2; x <= secretRoom.getRight() + 2; x++) {
+                    for (let y = secretRoom.getTop() - 2; y <= secretRoom.getBottom() + 2; y++) {
+                        // Skip cells inside secret room
+                        if (x >= secretRoom.getLeft() && x <= secretRoom.getRight() &&
+                            y >= secretRoom.getTop() && y <= secretRoom.getBottom()) continue;
+                        // Check if cell is valid floor
+                        if (x >= 0 && y >= 0 && x < MAP_COLS && y < MAP_ROWS &&
+                            this.dungeon.grid[x]?.[y] === 0) {
+                            adjacentCells.push({x: x * TILE_SIZE + TILE_SIZE/2, y: y * TILE_SIZE + TILE_SIZE/2});
+                        }
+                    }
+                }
+                // Place plate in random adjacent cell
+                if (adjacentCells.length > 0) {
+                    const platePos = adjacentCells[Math.floor(ROT.RNG.getUniform() * adjacentCells.length)];
+                    this.trapState.plates.push({
+                        id: `plate_${Math.random()}`,
+                        x: platePos.x,
+                        y: platePos.y,
+                        pressed: false,
+                        timer: 0,
+                        discovered: false
+                    });
+                }
+
+                // Add content to secret room: 1-2 enemies, 1 guaranteed chest, maybe NPC
+                const secretSpawns: any[] = [];
+                for (let x = secretRoom.getLeft(); x <= secretRoom.getRight(); x++) {
+                    for (let y = secretRoom.getTop(); y <= secretRoom.getBottom(); y++) {
+                        if (this.dungeon.grid[x][y] === 0) {
+                            secretSpawns.push({x: x * TILE_SIZE + TILE_SIZE/2, y: y * TILE_SIZE + TILE_SIZE/2, gx: x, gy: y});
+                        }
+                    }
+                }
+                const getSecretSpawn = () => secretSpawns.length > 0 ? secretSpawns.splice(Math.floor(ROT.RNG.getUniform() * secretSpawns.length), 1)[0] : null;
+
+                // Guaranteed chest in secret room
+                const chestSpawn = getSecretSpawn();
+                if (chestSpawn) {
+                    const possibleItems = Object.keys(ITEMS_DB);
+                    const numItems = Math.floor(ROT.RNG.getUniform() * 2) + 2; // 2-3 items, better loot
+                    const chestItems: ItemInstance[] = [];
+                    for (let i = 0; i < numItems; i++) {
+                        const itemId = possibleItems[Math.floor(ROT.RNG.getUniform() * possibleItems.length)];
+                        const spot = this.inventory.findFreeSpot({ id: itemId, instanceId: Math.random() }, chestItems);
+                        if (spot) {
+                            chestItems.push({ id: itemId, instanceId: Math.random(), x: spot.x, y: spot.y });
+                        }
+                    }
+                    const secretChestId = Math.random();
+                    this.chests.push({ id: secretChestId, x: chestSpawn.x, y: chestSpawn.y, items: chestItems });
+                    // Add secret room chest as obstacle
+                    this.obstacles.push({ x: chestSpawn.x - 12, y: chestSpawn.y - 10, w: 24, h: 20, type: 'chest', id: secretChestId });
+                }
+
+                // 1-2 enemies guarding the secret
+                const numSecretEnemies = Math.floor(ROT.RNG.getUniform() * 2) + 1;
+                for (let i = 0; i < numSecretEnemies; i++) {
+                    const sp = getSecretSpawn();
+                    if (sp) {
+                        this.spawnEnemy('chaser', sp.x, sp.y, 'guard');
+                    }
+                }
+
+                // 30% chance for civilian NPC in secret room
+                if (ROT.RNG.getUniform() < 0.3) {
+                    const npcSpawn = getSecretSpawn();
+                    if (npcSpawn) {
+                        this.spawnNPC('civilian', npcSpawn.x, npcSpawn.y);
+                    }
+                }
             }
 
             // Obstacles
@@ -556,123 +736,257 @@ class Game {
                 }
             }
 
-            // Spawns
-            const emptyCells: any[] = [];
-            for (let x = 0; x < MAP_COLS; x++) {
-                for (let y = 0; y < MAP_ROWS; y++) {
-                    if (this.dungeon.grid[x][y] === 0) {
-                        emptyCells.push({x: x * TILE_SIZE + TILE_SIZE/2, y: y * TILE_SIZE + TILE_SIZE/2, gx: x, gy: y});
-                    }
-                }
+            // Initialize SpawnManager for better spawn distribution
+            const spawnManager = new SpawnManager(
+                this.dungeon.grid,
+                rooms,
+                this.startDoor,
+                this.exitRoomCenter,
+                this.secretRoomCells
+            );
+
+            // Get separate spawn pools for different object types
+            // Room-only spawns: NPCs, chests, barrels - only in rooms, away from walls and doors
+            const roomSpawns = spawnManager.getRoomOnlySpawns(1, 3); // min 1 cell from wall, 3 from doors
+            // Corridor spawns: traps, pits - prefer narrow corridors
+            const corridorSpawns = spawnManager.getCorridorSpawns(2); // min 2 cells from doors
+
+            // Track placed objects for distance checks
+            const placedObjects: { x: number; y: number }[] = [];
+            const MIN_DISTANCE_OBJECTS = 80; // Минимальное расстояние между объектами (пиксели)
+            const MIN_DISTANCE_TRAPS = 100;   // Минимальное расстояние между ловушками
+
+            // Shuffle spawn pools for randomness
+            const shuffledRoomSpawns = roomSpawns.sort(() => ROT.RNG.getUniform() - 0.5);
+            const shuffledCorridorSpawns = corridorSpawns.sort(() => ROT.RNG.getUniform() - 0.5);
+
+            // ===== BARRELS - только в комнатах, не у стен, с расстоянием =====
+            const barrelProps = OBJECTS_DB['barrel'];
+            const barrelCount = Math.floor(ROT.RNG.getUniform() * barrelProps.maxPerRoom) + 1;
+            let barrelsSpawned = 0;
+            for (const spawn of shuffledRoomSpawns) {
+                if (barrelsSpawned >= barrelCount) break;
+                if (ROT.RNG.getUniform() >= barrelProps.spawnChance) continue;
+
+                // Check distance to other placed objects
+                if (!spawnManager.isDistanceValid(spawn.x, spawn.y, placedObjects, MIN_DISTANCE_OBJECTS)) continue;
+
+                const barrelId = Math.random();
+                this.barrels.push({
+                    id: barrelId,
+                    x: spawn.x,
+                    y: spawn.y,
+                    radius: 10,
+                    type: ROT.RNG.getUniform() < 0.33 ? 'water' : (ROT.RNG.getUniform() < 0.66 ? 'oil' : 'petroleum')
+                });
+                // Add barrel as obstacle for collision (20x20 size around center)
+                this.obstacles.push({ x: spawn.x - 10, y: spawn.y - 10, w: 20, h: 20, type: 'barrel', id: barrelId });
+                placedObjects.push({ x: spawn.x, y: spawn.y });
+                barrelsSpawned++;
             }
 
-            let validSpawns = emptyCells.filter(cell => cell.gy < 18 && Utils.dist(cell, {x: this.exitRoomCenter.x, y: this.exitRoomCenter.y}) > 60);
-            const getSpawn = () => validSpawns.length > 0 ? validSpawns.splice(Math.floor(ROT.RNG.getUniform() * validSpawns.length), 1)[0] : null;
+            // ===== CHESTS - только в комнатах, не у стен, с расстоянием =====
+            const chestProps = OBJECTS_DB['chest'];
+            let chestsSpawned = 0;
+            for (const spawn of shuffledRoomSpawns) {
+                if (chestsSpawned >= 1) break; // Максимум 1 сундук на подземелье
+                if (ROT.RNG.getUniform() >= chestProps.spawnChance) continue;
 
-            // Content: Barrels
-            const barrelProps = OBJECTS_DB['barrel'];
-            for (let i = 0; i < barrelProps.maxPerRoom; i++) {
-                if (ROT.RNG.getUniform() < barrelProps.spawnChance) {
-                    const sp = getSpawn();
-                    if (sp) {
-                        const tooClose = this.barrels.some(b => Utils.distSq(b, sp) < 2500);
-                        if (!tooClose) {
-                            this.barrels.push({ 
-                                id: Math.random(), x: sp.x, y: sp.y, radius: 10, 
-                                type: ROT.RNG.getUniform() < 0.33 ? 'water' : (ROT.RNG.getUniform() < 0.66 ? 'oil' : 'petroleum') 
+                // Check distance to other placed objects
+                if (!spawnManager.isDistanceValid(spawn.x, spawn.y, placedObjects, MIN_DISTANCE_OBJECTS)) continue;
+
+                // Generate random items for chest
+                const possibleItems = Object.keys(ITEMS_DB);
+                const numItems = Math.floor(ROT.RNG.getUniform() * 3) + 1; // 1-3 items
+                const chestItems: ItemInstance[] = [];
+
+                for (let i = 0; i < numItems; i++) {
+                    const itemId = possibleItems[Math.floor(ROT.RNG.getUniform() * possibleItems.length)];
+                    const spot = this.inventory.findFreeSpot({ id: itemId, instanceId: Math.random() }, chestItems);
+                    if (spot) {
+                        chestItems.push({
+                            id: itemId,
+                            instanceId: Math.random(),
+                            x: spot.x,
+                            y: spot.y
+                        });
+                    }
+                }
+
+                const chestId = Math.random();
+                this.chests.push({
+                    id: chestId,
+                    x: spawn.x,
+                    y: spawn.y,
+                    items: chestItems
+                });
+                // Add chest as obstacle for collision (24x20 size around center)
+                this.obstacles.push({ x: spawn.x - 12, y: spawn.y - 10, w: 24, h: 20, type: 'chest', id: chestId });
+                placedObjects.push({ x: spawn.x, y: spawn.y });
+                chestsSpawned++;
+            }
+
+            // ===== NPCs - только в комнатах, не у стен, с расстоянием =====
+            const civProps = OBJECTS_DB['npc_civilian'];
+            const eligibleRooms = spawnManager.getEligibleRooms();
+            const shuffledRooms = eligibleRooms.sort(() => ROT.RNG.getUniform() - 0.5);
+
+            for (const room of shuffledRooms) {
+                if (ROT.RNG.getUniform() >= civProps.spawnChance) continue;
+
+                // Get room-only spawns for this specific room
+                const roomOnlySpawns: { x: number; y: number; gx: number; gy: number }[] = [];
+                for (let x = room.left; x <= room.right; x++) {
+                    for (let y = room.top; y <= room.bottom; y++) {
+                        if (spawnManager.isValidRoomSpawn(x, y, 1, 3)) {
+                            roomOnlySpawns.push({
+                                x: x * TILE_SIZE + TILE_SIZE / 2,
+                                y: y * TILE_SIZE + TILE_SIZE / 2,
+                                gx: x, gy: y
                             });
                         }
                     }
                 }
+                if (roomOnlySpawns.length === 0) continue;
+
+                // Find a spawn that's not too close to other objects
+                const validSpawns = roomOnlySpawns.filter(spawn =>
+                    spawnManager.isDistanceValid(spawn.x, spawn.y, placedObjects, MIN_DISTANCE_OBJECTS)
+                );
+                if (validSpawns.length === 0) continue;
+
+                const sp = validSpawns[Math.floor(ROT.RNG.getUniform() * validSpawns.length)];
+                this.spawnNPC('civilian', sp.x, sp.y);
+                placedObjects.push({ x: sp.x, y: sp.y });
             }
 
-            // Chests
-            const chestProps = OBJECTS_DB['chest'];
-            if (ROT.RNG.getUniform() < chestProps.spawnChance) {
-                const sp = getSpawn();
-                if (sp) {
-                    this.chests.push({ 
-                        id: Math.random(), x: sp.x, y: sp.y, opened: false, 
-                        items: [{ id: 'pistol', x: 0, y: 0, instanceId: Math.random() }] 
-                    });
-                }
-            }
-
-            // Enemies in groups
-            let groupsCount = Math.min(4, Math.floor(ROT.RNG.getUniform() * 3) + 2 + Math.floor((this.roomLevel - 1) / 3)); 
+            // ===== ENEMIES - только в комнатах =====
+            const enemyRoomSpawns = [...shuffledRoomSpawns].filter(spawn =>
+                !placedObjects.some(obj => Utils.distSq(obj, spawn) < 1600) // Avoid placed objects (reduced from 2500 to 1600)
+            );
+            let groupsCount = Math.min(5, Math.floor(ROT.RNG.getUniform() * 3) + 3 + Math.floor(this.roomLevel / 2)); // Increased base groups and level scaling
             for (let g = 0; g < groupsCount; g++) {
-                const center = getSpawn();
-                if (!center) break;
+                if (enemyRoomSpawns.length === 0) break;
+                const centerIdx = Math.floor(ROT.RNG.getUniform() * enemyRoomSpawns.length);
+                const center = enemyRoomSpawns.splice(centerIdx, 1)[0];
+
                 let groupSize = Math.floor(ROT.RNG.getUniform() * 3) + 2;
                 let leaderRole: 'patroller' | 'guard' = ROT.RNG.getUniform() > 0.5 ? 'patroller' : 'guard';
                 let leader: Enemy | undefined = undefined;
                 let patrolPath: Point[] | undefined = undefined;
-                if (leaderRole === 'patroller') {
-                    const distant = validSpawns.length > 0 ? validSpawns[Math.floor(ROT.RNG.getUniform() * validSpawns.length)] : center;
-                    patrolPath = [{x: center.x, y: center.y}, {x: distant.x, y: distant.y}];
+
+                if (leaderRole === 'patroller' && enemyRoomSpawns.length > 0) {
+                    const distantIdx = Math.floor(ROT.RNG.getUniform() * enemyRoomSpawns.length);
+                    const distant = enemyRoomSpawns[distantIdx];
+                    patrolPath = [{ x: center.x, y: center.y }, { x: distant.x, y: distant.y }];
                 }
+
                 for (let i = 0; i < groupSize; i++) {
-                    const sp = i === 0 ? center : getSpawn();
+                    let sp: { x: number; y: number } | undefined;
+                    if (i === 0) {
+                        sp = center;
+                    } else if (enemyRoomSpawns.length > 0) {
+                        const idx = Math.floor(ROT.RNG.getUniform() * enemyRoomSpawns.length);
+                        sp = enemyRoomSpawns.splice(idx, 1)[0];
+                    }
                     if (!sp) break;
+
                     let db = ROT.RNG.getUniform() > 0.7 ? ENEMIES_DB['sniper'] : ENEMIES_DB['grunt'];
                     let role: 'patroller' | 'guard' | 'follower' = i === 0 ? leaderRole : 'follower';
                     let angle = (i / groupSize) * Math.PI * 2;
-                    let en: Enemy = {
-                        id: Math.random(), x: sp.x, y: sp.y, radius: 10, type: db.type, role, leader,
-                        patrolPath: patrolPath, patrolIndex: 0,
-                        followOffX: Math.cos(angle) * 40, followOffY: Math.sin(angle) * 40,
-                        speed: db.speed, health: db.health, maxHealth: db.health,
-                        fsm: interpret(enemyMachineDef).start(), memory: null, barkText: "", barkTimer: 0, alertTimer: 0, status: null, statusTimer: 0,
-                        anim: new AnimatedSprite(db.type === 'shooter' ? ANIMATIONS.ENEMY_SHOOTER_IDLE : ANIMATIONS.ENEMY_CHASER_WALK)
-                    };
+                    
+                    let en = this.spawnEnemy(db.type, sp.x, sp.y, role);
+                    en.leader = leader;
+                    en.patrolPath = patrolPath;
+                    en.angle = angle;
+                    en.followOffX = Math.cos(angle) * 40;
+                    en.followOffY = Math.sin(angle) * 40;
+                    en.anim = new AnimatedSprite(db.type === 'shooter' ? ANIMATIONS.ENEMY_SHOOTER_IDLE : ANIMATIONS.ENEMY_CHASER_WALK);
+
                     if (i === 0) leader = en;
-                    this.enemies.push(en);
                 }
             }
 
-            for (let i = 0; i < 3; i++) { let sp = getSpawn(); if (sp) this.trapState.spikes.push({ id: `spike_${i}`, x: sp.x, y: sp.y, state: 0, timer: 0 }); }
-            
-            const civProps = OBJECTS_DB['npc_civilian'];
-            for (let i = 0; i < civProps.maxPerRoom; i++) {
-                if (ROT.RNG.getUniform() < civProps.spawnChance) {
-                    const sp = getSpawn();
-                    if (sp) this.npcs.push(createCivilian(sp.x, sp.y));
+            // ===== SPIKE TRAPS - предпочтение коридорам, с расстоянием =====
+            const placedTraps: { x: number; y: number }[] = [];
+            const spikeCount = 3;
+            for (let i = 0; i < spikeCount; i++) {
+                // Сначала пробуем коридоры
+                let sp = spawnManager.getRandomSpawn(
+                    shuffledCorridorSpawns.filter(s => spawnManager.isDistanceValid(s.x, s.y, placedTraps, MIN_DISTANCE_TRAPS))
+                );
+                // Если в коридорах нет места, пробуем комнаты
+                if (!sp) {
+                    sp = spawnManager.getRandomSpawn(
+                        shuffledRoomSpawns.filter(s => spawnManager.isDistanceValid(s.x, s.y, placedTraps, MIN_DISTANCE_TRAPS))
+                    );
+                }
+                if (sp) {
+                    this.trapState.spikes.push({ id: `spike_${i}`, x: sp.x, y: sp.y, state: 0, timer: 0 });
+                    placedTraps.push({ x: sp.x, y: sp.y });
                 }
             }
-            
-            // Факелы - освещение комнаты
-            const torchProps = OBJECTS_DB['torch'];
-            const torchPositions: {x: number, y: number}[] = [];
-            for (let i = 0; i < torchProps.maxPerRoom; i++) {
-                if (ROT.RNG.getUniform() < torchProps.spawnChance) {
-                    const sp = getSpawn();
-                    if (sp) {
-                        // Проверка расстояния до других факелов (минимум 4 клетки)
-                        const tooClose = torchPositions.some(t => Utils.distSq({x: t.x, y: t.y}, {x: sp.gx, y: sp.gy}) < 16);
-                        if (!tooClose) {
-                            torchPositions.push({x: sp.gx, y: sp.gy});
-                            const torchId = `torch_${this.frameCounter}_${i}`;
-                            lumen.addLight({
-                                id: torchId,
-                                x: sp.gx,
-                                y: sp.gy,
-                                radius: 6,
-                                intensity: 0.9,
-                                type: LightType.STATIC,
-                                active: true
-                            });
-                        }
-                    }
+
+            // ===== PIT TRAPS - предпочтение коридорам, с расстоянием =====
+            const pitProps = OBJECTS_DB['trap_pit'];
+            const pitCount = Math.floor(ROT.RNG.getUniform() * pitProps.maxPerRoom);
+            for (let i = 0; i < pitCount; i++) {
+                if (ROT.RNG.getUniform() >= pitProps.spawnChance) continue;
+
+                // Сначала пробуем коридоры
+                let sp = spawnManager.getRandomSpawn(
+                    shuffledCorridorSpawns.filter(s => spawnManager.isDistanceValid(s.x, s.y, placedTraps, MIN_DISTANCE_TRAPS))
+                );
+                // Если в коридорах нет места, пробуем комнаты
+                if (!sp) {
+                    sp = spawnManager.getRandomSpawn(
+                        shuffledRoomSpawns.filter(s => spawnManager.isDistanceValid(s.x, s.y, placedTraps, MIN_DISTANCE_TRAPS))
+                    );
                 }
+                if (sp) {
+                    this.trapState.pits.push({ id: `pit_${i}`, x: sp.x, y: sp.y });
+                    placedTraps.push({ x: sp.x, y: sp.y });
+                }
+            }
+
+            // ===== TORCHES - в комнатах, с расстоянием =====
+            const torchProps = OBJECTS_DB['torch'];
+            const torchPositions: { x: number; y: number }[] = [];
+            for (let i = 0; i < torchProps.maxPerRoom; i++) {
+                if (ROT.RNG.getUniform() >= torchProps.spawnChance) continue;
+
+                const validSpawns = shuffledRoomSpawns.filter(s =>
+                    !torchPositions.some(t => Utils.distSq({ x: t.x, y: t.y }, { x: s.gx, y: s.gy }) < 64) // Минимум 8 клеток между факелами
+                );
+                if (validSpawns.length === 0) continue;
+
+                const sp = validSpawns[Math.floor(ROT.RNG.getUniform() * validSpawns.length)];
+                torchPositions.push({ x: sp.gx, y: sp.gy });
+                const torchId = `torch_${this.frameCounter}_${i}`;
+                this.torches.push({ id: torchId, x: sp.x, y: sp.y, gx: sp.gx, gy: sp.gy });
+                lumen.addLight({
+                    id: torchId,
+                    x: sp.gx,
+                    y: sp.gy,
+                    radius: 6,
+                    intensity: 0.9,
+                    type: LightType.STATIC,
+                    active: true
+                });
             }
         }
 
         this.roomSnapshot = {
             inventoryItems: this.inventoryItems.map(it => ({...it})),
-            enemies: this.enemies.map(e => ({...e, fsm: interpret(enemyMachineDef).start()})),
+            enemies: Array.from(this.enemiesMap.values()).map(e => ({...e, fsm: null})), // We rebuild FSM on restore
             trapState: JSON.parse(JSON.stringify(this.trapState)),
             chests: JSON.parse(JSON.stringify(this.chests)),
-            npcs: JSON.parse(JSON.stringify(this.npcs))
+            barrels: JSON.parse(JSON.stringify(this.barrels)),
+            torches: JSON.parse(JSON.stringify(this.torches)),
+            npcs: Array.from(this.npcsMap.values()).map(n => ({...n, fsm: null})),
+            obstacles: JSON.parse(JSON.stringify(this.obstacles)),
+            secretDoors: JSON.parse(JSON.stringify(this.secretDoors)),
+            secretDoorObstacles: JSON.parse(JSON.stringify(this.secretDoorObstacles))
         };
 
         this.updateStaticLayer();
@@ -684,7 +998,9 @@ class Game {
             this.dungeon.grid, 
             this.secretDoors, 
             this.secretRoomOpen, 
-            this.secretRoomCells
+            this.secretRoomCells,
+            this.player.x,
+            this.player.y
         );
     }
 
@@ -702,6 +1018,21 @@ class Game {
         const isSecDoor = this.secretDoors.some(d => d.x === x && d.y === y);
         if (this.dungeon.grid[x][y] === 1) { if (isSecDoor && this.secretRoomOpen) {} else return false; }
         if (this.startDoor && !this.startDoor.open && y === 22 && x >= 17 && x <= 22) return false;
+        // Check for objects (barrels and chests) that block pathfinding
+        const worldX = x * TILE_SIZE + TILE_SIZE / 2;
+        const worldY = y * TILE_SIZE + TILE_SIZE / 2;
+        // Check barrels
+        for (const barrel of this.barrels) {
+            if (Math.abs(barrel.x - worldX) < TILE_SIZE * 0.8 && Math.abs(barrel.y - worldY) < TILE_SIZE * 0.8) {
+                return false;
+            }
+        }
+        // Check chests
+        for (const chest of this.chests) {
+            if (Math.abs(chest.x - worldX) < TILE_SIZE * 0.8 && Math.abs(chest.y - worldY) < TILE_SIZE * 0.8) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -757,32 +1088,65 @@ class Game {
         }
     }
 
-    private canEnemySeePlayer(enemyTileX: number, enemyTileY: number, maxRange: number): boolean {
-        const px = Math.floor(this.player.x / TILE_SIZE);
-        const py = Math.floor(this.player.y / TILE_SIZE);
-        const distSq = (px - enemyTileX) ** 2 + (py - enemyTileY) ** 2;
-        if (distSq > maxRange * maxRange) return false;
+    private isBlocking = (gx: number, gy: number) => {
+        if (gx < 0 || gy < 0 || gx >= MAP_COLS || gy >= MAP_ROWS) return true;
+        if (this.dungeon.grid[gx][gy] === 1) {
+            const isSecDoor = this.secretDoors.some(d => d.x === gx && d.y === gy);
+            if (!(isSecDoor && this.secretRoomOpen)) return true;
+        }
+        return false;
+    };
 
-        const steps = Math.max(Math.abs(px - enemyTileX), Math.abs(py - enemyTileY));
-        for (let i = 1; i <= steps; i++) {
-            const t = i / steps;
-            const tx = Math.floor(enemyTileX + (px - enemyTileX) * t);
-            const ty = Math.floor(enemyTileY + (py - enemyTileY) * t);
-            if ((tx !== enemyTileX || ty !== enemyTileY) && !this.isPassable(tx, ty)) {
-                return tx === px && ty === py;
+    private countWallsBetween(x1: number, y1: number, x2: number, y2: number): number {
+        let tx1 = Math.floor(x1 / TILE_SIZE);
+        let ty1 = Math.floor(y1 / TILE_SIZE);
+        const tx2 = Math.floor(x2 / TILE_SIZE);
+        const ty2 = Math.floor(y2 / TILE_SIZE);
+
+        const dx = Math.abs(tx2 - tx1);
+        const dy = Math.abs(ty2 - ty1);
+        const sx = tx1 < tx2 ? 1 : -1;
+        const sy = ty1 < ty2 ? 1 : -1;
+        let err = dx - dy;
+
+        let walls = 0;
+        while (tx1 !== tx2 || ty1 !== ty2) {
+            const e2 = err * 2;
+            if (e2 > -dy) { err -= dy; tx1 += sx; }
+            if (e2 < dx) { err += dx; ty1 += sy; }
+            if (this.dungeon.grid[tx1]?.[ty1] === 1) {
+                const isSecDoor = this.secretDoors.some(d => d.x === tx1 && d.y === ty1);
+                if (!(isSecDoor && this.secretRoomOpen)) walls++;
             }
         }
-        return true;
+        return walls;
     }
 
     private update() {
         this.frameCounter++;
+
+        // Handle death animation countdown
+        if (this.deathAnimTimer > 0) {
+            this.deathAnimTimer--;
+            if (this.deathAnimTimer <= 0) {
+                this.finishRestartRoom();
+            }
+            this.particles.update();
+            return; // Skip normal update during death animation
+        }
+
+        // Update particles even when dead
+        if (this.isDead) {
+            this.particles.update();
+            return;
+        }
+
         this.particles.update();
         
         // Update animations
         const dt = 16.66; // Approx 60fps
         if (this.player.anim) this.player.anim.update(dt);
-        this.enemies.forEach(e => {
+        this.enemiesMap.values().forEach(e => {
             if (e.anim) e.anim.update(dt);
         });
         
@@ -808,14 +1172,18 @@ class Game {
 
         if (this.gameState === 'PLAYING') {
             this.updateStatuses();
+            if (this.isDead) return;
             this.updatePlayer();
+            if (this.isDead) return;
             this.updateEnemies();
+            if (this.isDead) return;
             this.updateProjectiles();
-            this.traps.update(this.player, this.enemies, this.trapState, this.ui.state.godMode, this.secretRoomCells);
+            if (this.isDead) return;
+            this.traps.update(this.player, Array.from(this.enemiesMap.values()), this.trapState, this.ui.state.godMode, this.secretRoomCells);
             if (this.roomActive && this.frameCounter % 4 === 0) this.fluids.step(this.isPassable, (x, y) => this.makeNoise(x, y, 400));
             
             // Exit logic
-            if (this.roomActive && this.enemies.length === 0 && this.doors.length === 0) {
+            if (this.roomActive && this.enemiesMap.size === 0 && this.doors.length === 0) {
                 this.doors = [{ x: this.exitRoomCenter.x - 30, y: this.exitRoomCenter.y - 20, w: 60, h: 40, type: 'exit' }];
                 sfx.roomClear();
                 this.roomClearTimer = 180;
@@ -858,6 +1226,9 @@ class Game {
                 frameCount: this.frameCounter,
                 playerPos: { x: px, y: py },
                 playerVisionRadius: fovRadius,
+                playerAngle: this.player.angle,
+                playerFovAngle: Math.PI / 3, // 60 degree cone
+                absoluteVisibilityRadius: 2, // 2 cells absolute visibility around player
                 isBlocking: (x, y) => !this.isPassable(x, y)
             });
             this.refreshExploredFromLumen();
@@ -888,9 +1259,12 @@ class Game {
         }
 
         // Enemies
-        this.enemies.forEach(e => {
-            const ex = Math.floor(e.x / TILE_SIZE);
-            const ey = Math.floor(e.y / TILE_SIZE);
+        const enemies = enemyQuery(this.world);
+        for (let i = 0; i < enemies.length; i++) {
+            const eid = enemies[i];
+            const e = this.enemiesMap.get(eid)!;
+            const ex = Math.floor(Position.x[eid] / TILE_SIZE);
+            const ey = Math.floor(Position.y[eid] / TILE_SIZE);
             const eTile = grid[ex]?.[ey];
             if (eTile && eTile.vol > 50) {
                 e.status = eTile.type;
@@ -901,16 +1275,24 @@ class Game {
             }
 
             // Contact death
-            if (!this.ui.state.godMode && !this.player.isDashing && Utils.distSq(e, this.player) < (e.radius + this.player.radius)**2) {
+            if (!this.ui.state.godMode && !this.player.isDashing && Utils.distSq({x: Position.x[eid], y: Position.y[eid]}, {x: Position.x[this.player.eid], y: Position.y[this.player.eid]}) < (12 + this.player.radius)**2) {
                 this.restartRoom();
             }
-        });
+        }
     }
 
     private updatePlayer() {
+        // Sync bitECS -> legacy
+        this.player.x = Position.x[this.player.eid];
+        this.player.y = Position.y[this.player.eid];
+
         if (this.player.isReloading) {
             this.player.reloadTimer--;
-            if (this.player.reloadTimer <= 0) { this.player.isReloading = false; this.player.ammo = this.player.computedStats.maxAmmo; this.updateUI(); }
+            if (this.player.reloadTimer <= 0) { 
+                this.player.isReloading = false; 
+                this.player.ammo = this.player.computedStats.maxAmmo; 
+                this.updateUI(); 
+            }
         }
 
         let dx = 0, dy = 0;
@@ -938,13 +1320,16 @@ class Game {
 
             // Update player animation state
             if (dx !== 0 || dy !== 0) {
+                if (this.frameCounter % 15 === 0) {
+                    this.makeNoise(this.player.x, this.player.y, 150);
+                }
+
                 if (Math.abs(dy) > Math.abs(dx)) {
                     this.player.anim = new AnimatedSprite(dy > 0 ? ANIMATIONS.PLAYER_WALK_DOWN : ANIMATIONS.PLAYER_WALK_UP);
                 } else {
                     this.player.anim = new AnimatedSprite(ANIMATIONS.PLAYER_WALK_SIDE);
                 }
             } else {
-                // Idle animations (simplified to just use current dir idle frame if we wanted to be fancy)
                 if (this.player.anim) {
                     const frames = (this.player.anim as any).def.frames[0];
                     if (frames.includes('_d')) this.player.anim = new AnimatedSprite(ANIMATIONS.PLAYER_IDLE_DOWN);
@@ -953,30 +1338,25 @@ class Game {
                 }
             }
 
-            // Рывок в направлении движения (WASD) или последнего угла
             if (this.input.keys.Space && this.frameCounter % 60 === 0) {
                 this.player.isDashing = true;
                 this.player.dashTimer = this.player.baseStats.dashDuration;
                 
-                // Определяем направление рывка по нажатым клавишам WASD
                 let dashDx = 0, dashDy = 0;
                 if (this.input.keys.KeyW) dashDy -= 1;
                 if (this.input.keys.KeyS) dashDy += 1;
                 if (this.input.keys.KeyA) dashDx -= 1;
                 if (this.input.keys.KeyD) dashDx += 1;
                 
-                // Если нажато направление - используем его, иначе последний угол
                 if (dashDx !== 0 || dashDy !== 0) {
-                    // Нормализуем вектор
                     const len = Math.sqrt(dashDx * dashDx + dashDy * dashDy);
-                    dashDx /= len;
-                    dashDy /= len;
+                    dashDx /= len; dashDy /= len;
                     this.player.dashAngle = Math.atan2(dashDy, dashDx);
                 }
-                // Если направление не задано, используем текущий угол игрока
                 
                 sfx.dash();
                 this.particles.spawn(this.player.x, this.player.y, 5, 1, 3);
+                this.makeNoise(this.player.x, this.player.y, 400);
             }
         }
 
@@ -1015,24 +1395,16 @@ class Game {
                 }
                 this.player.ammo--;
                 
-                // Получить уровень света на позиции игрока для модификаторов
                 const px = Math.floor(this.player.x / TILE_SIZE);
                 const py = Math.floor(this.player.y / TILE_SIZE);
                 const playerLightLevel = this.getCellLightLevel(px, py);
                 
-                // Применить модификаторы света к точности
-                const baseAccuracy = 0.85;  // базовая точность игрока
+                const baseAccuracy = 0.85;
                 const modifiedAccuracy = this.combat.applyLightToAccuracy(baseAccuracy, playerLightLevel);
-                
-                // Если враг замечает выстрел
-                if (this.combat.willPlayerBeDetected(playerLightLevel)) {
-                    // Это может быть обработано в логике обнаружения врагов
-                }
                 
                 const projs = this.combat.spawnProjectiles(this.player, this.player.angle, { projectiles: this.player.computedStats.projectiles, spreadAngle: this.player.computedStats.spreadAngle }, 0, this.player.radius, false);
                 this.bullets.push(...projs);
                 
-                // Вспышка выстрела - создает ярко видимый источник света
                 lumen.addLight({
                     id: `muzzle_${this.frameCounter}`,
                     x: px,
@@ -1049,66 +1421,69 @@ class Game {
                 if (this.player.ammo <= 0) this.reload();
             }
         }
+
+        // Sync legacy -> bitECS
+        Position.x[this.player.eid] = this.player.x;
+        Position.y[this.player.eid] = this.player.y;
     }
 
     private updateEnemies() {
         let inCombat = false;
         const grid = this.fluids.getGrid();
+        const enemies = enemyQuery(this.world);
+        for (let i = 0; i < enemies.length; i++) {
+            const eid = enemies[i];
+            const e = this.enemiesMap.get(eid)!;
+            const idx = i;
+            
+            e.x = Position.x[eid];
+            e.y = Position.y[eid];
 
-        this.enemies.forEach((e, idx) => {
-            // Repulsion
-            this.enemies.forEach(other => {
-                if (e !== other) {
-                    const dSq = Utils.distSq(e, other);
+            for (let j = 0; j < enemies.length; j++) {
+                const otherEid = enemies[j];
+                if (eid !== otherEid) {
+                    const dx = Position.x[eid] - Position.x[otherEid];
+                    const dy = Position.y[eid] - Position.y[otherEid];
+                    const dSq = dx * dx + dy * dy;
                     if (dSq > 0 && dSq < 900) {
                         const dist = Math.sqrt(dSq);
                         const push = (30 - dist) / 30;
-                        e.x += ((e.x - other.x) / dist) * push * 1.5;
-                        e.y += ((e.y - other.y) / dist) * push * 1.5;
+                        Position.x[eid] += (dx / dist) * push * 1.5;
+                        Position.y[eid] += (dy / dist) * push * 1.5;
                     }
                 }
-            });
-
-            const ex = Math.floor(e.x/TILE_SIZE), ey = Math.floor(e.y/TILE_SIZE);
-            const px = Math.floor(this.player.x/TILE_SIZE), py = Math.floor(this.player.y/TILE_SIZE);
-            let canSeePlayer = false;
-            
-            // Стелс-механика: тьма помогает скрываться
-            let baseDetectionRadius = 12;
-            const pTile = grid[px]?.[py];
-            if (pTile && pTile.steam > 50) baseDetectionRadius = 4;  // Пар блокирует видимость
-            
-            const playerLight = this.getCellLightLevel(px, py);
-            const playerLighting = lumen.getLightingInfo(px, py);
-            
-            // Использовать новую систему обнаружения на основе света
-            const detectionParams: EnemyDetectionParams = {
-                enemyPos: e,
-                playerPos: this.player,
-                playerLightLevel: playerLight,
-                playerShadowIntensity: playerLighting.shadowIntensity,
-                baseDetectionRadius: baseDetectionRadius
-            };
-            
-            // Проверить, может ли враг видеть игрока на основе расстояния и света
-            if (Utils.distSq(e, this.player) < 250000) {
-                const detectionChance = calculateEnemyDetectionChance(detectionParams);
-                canSeePlayer = Math.random() < detectionChance && this.canEnemySeePlayer(ex, ey, 20);  // Использовать большой радиус для line-of-sight
             }
+
+            decayNoise(e, 0.1);
+            if (e.noiseLevel > 0 && e.noisePosition) {
+                const rotationSpeed = e.noiseLevel > 60 ? 0.12 : 0.04;
+                (EnemyActions as any).turnTowards(e, e.noisePosition, rotationSpeed);
+            }
+
+            if ((this.frameCounter + idx) % 6 === 0) {
+                e.lastCanSeePlayer = checkVisionCone(e, this.player, this.isBlocking);
+            }
+            const canSeePlayer = e.lastCanSeePlayer || false;
 
             if (canSeePlayer) {
-                e.memory = { x: px, y: py };
-                if (e.fsm.state.value === 'patrol' || e.fsm.state.value === 'investigate') { e.fsm.send('PLAYER_SPOTTED'); e.alertTimer = 60; }
-                else if (e.fsm.state.value === 'alerting') { e.alertTimer--; if (e.alertTimer <= 0) e.fsm.send('ALERT_DONE'); }
-            } else {
-                if (!e.memory && (e.fsm.state.value === 'chase' || e.fsm.state.value === 'attack')) e.fsm.send('PLAYER_LOST');
-            }
+                updateMemory(e, { x: Position.x[this.player.eid], y: Position.y[this.player.eid] });
+                if (e.fsm.state.value === 'patrol' || e.fsm.state.value === 'investigate') { 
+                    e.fsm.send('PLAYER_SPOTTED'); e.alertTimer = 45; 
+                    this.addFloatingText(Position.x[eid], Position.y[eid] - 20, "!", "#f00");
+                } else if (e.fsm.state.value === 'alerting') { 
+                    e.alertTimer--; if (e.alertTimer <= 0) e.fsm.send('ALERT_DONE'); 
+                }
+            } else if (e.noiseLevel >= 100) {
+                if (e.fsm.state.value === 'patrol') e.fsm.send('HEARD_NOISE');
+            } else if (hasValidMemory(e)) {
+                if (e.fsm.state.value === 'chase' || e.fsm.state.value === 'attack' || e.fsm.state.value === 'alerting') e.fsm.send('PLAYER_LOST');
+                decrementMemoryTimer(e);
+            } else if (e.fsm.state.value !== 'patrol') e.fsm.send('REACHED_TARGET');
 
-            // Memory sharing
             if (e.role === 'follower' && e.leader && e.leader.fsm) {
                 const lState = e.leader.fsm.state.value;
                 if (lState !== 'patrol' && e.fsm.state.value === 'patrol') {
-                    e.memory = e.leader.memory ? {...e.leader.memory} : null;
+                    if (e.leader.lastKnownPosition) updateMemory(e, e.leader.lastKnownPosition);
                     if (lState === 'investigate') e.fsm.send('HEARD_NOISE');
                     else if (lState === 'alerting' || lState === 'chase' || lState === 'attack') { e.fsm.send('PLAYER_SPOTTED'); e.alertTimer = e.leader.alertTimer || 60; }
                 }
@@ -1116,40 +1491,27 @@ class Game {
 
             const state = e.fsm.state.value;
             if (state === 'chase' || state === 'attack') inCombat = true;
+            (EnemyActions as any)[state](e, canSeePlayer, this.obstacles, this.isPassable, this.player, this.enemiesMap.values());
+            Position.x[eid] = e.x; Position.y[eid] = e.y;
 
-            (EnemyActions as any)[state](e, canSeePlayer, this.obstacles, this.isPassable, this.player, this.enemies);
-
-            // Barking
             if (e.barkTimer > 0) e.barkTimer--;
             if (e.barkTimer <= 0 && canSeePlayer && Math.random() < 0.005) { e.barkText = ENEMY_BARKS[Math.floor(Math.random()*ENEMY_BARKS.length)]; e.barkTimer = 90; }
 
-            // Shooter AI
             if (e.type === 'shooter' && (state === 'chase' || state === 'attack') && canSeePlayer && this.frameCounter % 60 === 0) {
                 if (e.status === 'petroleum') {
-                    this.addFloatingText(e.x, e.y - 20, "ИСКРА!", "#f00");
-                    sfx.explosion();
-                    this.particles.spawn(e.x, e.y, 60, 2, 5);
-                    this.killEnemy(idx);
+                    this.addFloatingText(Position.x[eid], Position.y[eid] - 20, "ИСКРА!", "#f00");
+                    sfx.explosion(); this.particles.spawn(Position.x[eid], Position.y[eid], 60, 2, 5); this.killEnemy(eid);
                 } else {
-                    let spread = 0;
-                    if (pTile && pTile.steam > 50) spread = 0.5;
-                    const angle = Math.atan2(this.player.y - e.y, this.player.x - e.x) + (Math.random() - 0.5) * spread;
-                    this.bullets.push({ x: e.x, y: e.y, vx: Math.cos(angle)*4, vy: Math.sin(angle)*4, radius: 3, isEnemy: true });
-                    lumen.addLight({
-                        id: `enemy_muzzle_${e.id}_${this.frameCounter}`,
-                        x: Math.floor(e.x / TILE_SIZE),
-                        y: Math.floor(e.y / TILE_SIZE),
-                        radius: 2,
-                        intensity: 0.6,
-                        type: LightType.TEMPORARY,
-                        active: true,
-                        ttl: 50
-                    });
+                    const px = Math.floor(Position.x[this.player.eid]/TILE_SIZE), py = Math.floor(Position.y[this.player.eid]/TILE_SIZE);
+                    const pTile = grid[px]?.[py];
+                    let spread = 0; if (pTile && pTile.steam > 50) spread = 0.5;
+                    const angle = Math.atan2(Position.y[this.player.eid] - Position.y[eid], Position.x[this.player.eid] - Position.x[eid]) + (Math.random() - 0.5) * spread;
+                    this.bullets.push({ x: Position.x[eid], y: Position.y[eid], vx: Math.cos(angle)*4, vy: Math.sin(angle)*4, radius: 3, isEnemy: true, id: Math.random(), damage: 1, type: 'enemy', lifetime: 180 });
+                    lumen.addLight({ id: `enemy_muzzle_${eid}_${this.frameCounter}`, x: Math.floor(Position.x[eid] / TILE_SIZE), y: Math.floor(Position.y[eid] / TILE_SIZE), radius: 2, intensity: 0.6, type: LightType.TEMPORARY, active: true, ttl: 50 });
                     sfx.enemyShoot();
                 }
             }
-        });
-
+        }
         if (inCombat) this.combatIntensity = Math.min(1, this.combatIntensity + 0.05);
         else this.combatIntensity = Math.max(0, this.combatIntensity - 0.02);
     }
@@ -1158,36 +1520,31 @@ class Game {
         for (let i = this.bullets.length - 1; i >= 0; i--) {
             let b = this.bullets[i];
             b.x += b.vx; b.y += b.vy;
-            this.particles.spawn(b.x, b.y, 1, 1, 1); // Bullet trace
+            this.particles.spawn(b.x, b.y, 1, 1, 1);
             if (b.x < 0 || b.x > GAME_WIDTH || b.y < 0 || b.y > GAME_HEIGHT) { this.bullets.splice(i, 1); continue; }
             
             let hit = false;
             for (let obs of this.obstacles) {
-                if (b.x > obs.x && b.x < obs.x + obs.w && b.y > obs.y && b.y < obs.y + obs.h) {
-                    hit = true; break;
-                }
+                if (b.x > obs.x && b.x < obs.x + obs.w && b.y > obs.y && b.y < obs.y + obs.h) { hit = true; break; }
             }
             if (hit) { this.particles.spawn(b.x, b.y, 5, 2, 2); this.bullets.splice(i, 1); continue; }
 
-            // Barrel hit
             for (let j = this.barrels.length - 1; j >= 0; j--) {
                 const brl = this.barrels[j];
-                if (Utils.distSq(brl, b) < (brl.radius + b.radius)**2) {
-                    this.destroyBarrel(j);
-                    this.bullets.splice(i, 1);
-                    hit = true; break;
-                }
+                if (Utils.distSq(brl, b) < (brl.radius + b.radius)**2) { this.destroyBarrel(j); this.bullets.splice(i, 1); hit = true; break; }
             }
             if (hit) continue;
 
             if (!b.isEnemy) {
-                for (let j = this.enemies.length - 1; j >= 0; j--) {
-                    if (Utils.distSq(this.enemies[j], b) < (this.enemies[j].radius + b.radius)**2) {
-                        this.killEnemy(j); this.bullets.splice(i, 1); break;
+                const enemies = enemyQuery(this.world);
+                for (let j = enemies.length - 1; j >= 0; j--) {
+                    const eid = enemies[j];
+                    if (Utils.distSq({x: Position.x[eid], y: Position.y[eid]}, b) < (12 + b.radius)**2) {
+                        this.killEnemy(eid); this.bullets.splice(i, 1); break;
                     }
                 }
             } else {
-                if (!this.ui.state.godMode && !this.player.isDashing && Utils.distSq(this.player, b) < (this.player.radius + b.radius)**2) {
+                if (!this.ui.state.godMode && !this.player.isDashing && Utils.distSq({x: Position.x[this.player.eid], y: Position.y[this.player.eid]}, b) < (this.player.radius + b.radius)**2) {
                     this.restartRoom(); break;
                 }
             }
@@ -1198,8 +1555,18 @@ class Game {
         this.render.clear();
         if (this.gameState === 'GLOBAL_MAP') {
             this.drawGlobalMap();
-        } else if (this.gameState === 'PLAYING' || this.gameState === 'INVENTORY' || this.gameState === 'EXIT_CONFIRM' || this.gameState === 'DIALOG') {
+        } else if (this.gameState === 'PLAYING' || this.gameState === 'INVENTORY' || this.gameState === 'EXIT_CONFIRM' || this.gameState === 'DIALOG' || this.gameState === 'CHEST') {
+            // Обновляем позицию игрока для параллакс эффекта
+            this.render.updatePlayerPosition(this.player.x, this.player.y);
+            
+            // Рисуем параллакс слои (фон)
+            this.render.drawParallaxLayers();
+            
             this.render.drawStaticLayer();
+            
+            // Рисуем overlay детали (трещины, мох, кровь)
+            this.overlay.draw(this.ctx, this.spriteCache);
+            
             this.drawSecretVisuals();
             this.drawFluids();
             this.drawEntities();
@@ -1208,7 +1575,7 @@ class Game {
                 this.ctx.fillStyle = '#fff';
                 this.ctx.beginPath(); this.ctx.arc(b.x, b.y, b.radius, 0, Math.PI*2); this.ctx.fill();
             });
-            this.render.drawDitherOverlay(this.isCellVisible, this.getCellLightLevel, this.dungeon.explored, this.ui.state.seeAllMap);
+            this.render.drawDitherOverlay(this.isCellVisible, this.getCellLightLevel, this.dungeon.explored, this.ui.state.seeAllMap, lumen.getAO.bind(lumen));
             
             // Отрисовка эффектов вспышек для источников света (магические эффекты)
             lumen.getAllLightIds().forEach(id => {
@@ -1229,13 +1596,41 @@ class Game {
             
             this.drawCinemaLines();
 
-            if (this.gameState === 'INVENTORY') this.drawInventory();
+            if (this.gameState === 'INVENTORY' || this.gameState === 'CHEST') this.drawInventory();
             if (this.gameState === 'EXIT_CONFIRM') this.drawExitConfirm();
             if (this.gameState === 'DIALOG') this.drawDialogPopup();
         }
         
         if (this.gameState === 'GAME_OVER') this.drawFullscreenMessage("ТВОЯ ВОЛЯ СЛОМЛЕНА", "Кликни, чтобы начать новый забег");
         if (this.gameState === 'VICTORY') this.drawFullscreenMessage("ВЫ ПОКОРИЛИ ПОДЗЕМЕЛЬЕ!", "Кликни, чтобы начать заново");
+
+        // Death animation - Smooth fade to black like Hotline Miami
+        if (this.deathAnimTimer > 0) {
+            const ctx = this.ctx;
+
+            // Smooth fade - progress 0 to 1
+            const progress = 1 - (this.deathAnimTimer / 120);
+
+            ctx.save();
+            ctx.fillStyle = `rgba(0, 0, 0, ${progress})`;
+            ctx.fillRect(0, 0, GAME_WIDTH, GAME_HEIGHT);
+            ctx.restore();
+        }
+
+        // Draw death state
+        if (this.isDead) {
+            const ctx = this.ctx;
+            
+            // Draw "R to restart" message
+            ctx.save();
+            ctx.font = 'bold 20px "IBM Plex Mono"';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#fff';
+            ctx.shadowColor = '#000';
+            ctx.shadowBlur = 4;
+            ctx.fillText('[R] TO RESTART', GAME_WIDTH / 2, GAME_HEIGHT / 2 + 80);
+            ctx.restore();
+        }
     }
 
     private drawSecretVisuals() {
@@ -1396,7 +1791,7 @@ class Game {
             
             if (node.status === 'available' || node.status === 'completed') { 
                 ctx.fillStyle = node.status === 'available' ? '#000' : '#888'; ctx.font = 'bold 20px "IBM Plex Mono", monospace'; 
-                let ch = node.type === 'merchant' ? '$' : (node.type === 'shrine' ? 'H' : (node.next.length === 0 ? 'B' : 'R'));
+                let ch = node.type === 'merchant' ? '$' : (node.type === 'shrine' ? 'H' : (node.type === 'boss' ? '!' : (node.next.length === 0 ? 'E' : 'R')));
                 ctx.fillText(ch, node.x, node.y + 2); 
             }
         }
@@ -1422,86 +1817,130 @@ class Game {
             if (!this.startDoor.open) { ctx.fillStyle = '#fff'; ctx.font = '14px "IBM Plex Mono"'; ctx.fillText("[ ВХОД ]", this.startDoor.x + this.startDoor.w/2, this.startDoor.y + 12); ctx.font = 'bold 20px "IBM Plex Mono"'; }
         }
 
-        this.chests.forEach(c => { 
-            if (!c.opened && (isMapFull || this.isCellVisible(Math.floor(c.x/TILE_SIZE), Math.floor(c.y/TILE_SIZE)))) { 
+        this.chests.forEach(c => {
+            if (isMapFull || this.isCellVisible(Math.floor(c.x/TILE_SIZE), Math.floor(c.y/TILE_SIZE))) {
                 this.render.drawShadow(c.x, c.y + 5, 12);
-                const sprite = this.spriteCache.get('obj_chest');
-                if (sprite) ctx.drawImage(sprite, c.x - sprite.width/2, c.y - sprite.height/2);
-                else { ctx.fillStyle = '#fff'; ctx.fillText("[+]", c.x, c.y); }
-                if (Utils.dist(this.player, c) < 30) { ctx.font = '14px "IBM Plex Mono"'; ctx.fillText("[E] Сундук", c.x, c.y - 15); ctx.font = 'bold 20px "IBM Plex Mono"'; }
-            } 
-        });
-        this.trapState.pits.forEach(p => { 
-            if (!isMapFull && !this.isCellVisible(Math.floor(p.x / TILE_SIZE), Math.floor(p.y / TILE_SIZE))) return;
-            const sprite = this.spriteCache.get('tile_pit');
-            if (sprite) ctx.drawImage(sprite, p.x - TILE_SIZE/2, p.y - TILE_SIZE/2);
-            else { ctx.fillStyle = '#111'; ctx.fillText('O', p.x, p.y); }
-        });
-        this.trapState.spikes.forEach(s => { 
-            if (!isMapFull && !this.isCellVisible(Math.floor(s.x / TILE_SIZE), Math.floor(s.y / TILE_SIZE))) return;
-            const sprite = this.spriteCache.get(s.state === 2 ? 'obj_spikes_1' : 'obj_spikes_0');
-            if (sprite) ctx.drawImage(sprite, s.x - sprite.width/2, s.y - sprite.height/2);
-            else { ctx.fillStyle = s.state === 2 ? '#fff' : '#666'; ctx.fillText('^', s.x, s.y); }
-        });
-        this.trapState.plates.forEach(p => { 
-            if (!isMapFull && !this.isCellVisible(Math.floor(p.x / TILE_SIZE), Math.floor(p.y / TILE_SIZE))) return;
-            const sprite = this.spriteCache.get(p.pressed ? 'obj_plate_1' : 'obj_plate_0');
-            if (sprite) ctx.drawImage(sprite, p.x - sprite.width/2, p.y - sprite.height/2);
-            else { ctx.fillStyle = p.pressed ? '#444' : '#fff'; ctx.fillText('=', p.x, p.y); }
-        });
-
-        this.npcs.forEach(n => {
-            if (isMapFull || this.isCellVisible(Math.floor(n.x/TILE_SIZE), Math.floor(n.y/TILE_SIZE))) {
-                this.render.drawShadow(n.x, n.y + 8, 10);
-                const sprite = this.spriteCache.get(n.type === 'shrine' ? 'obj_altar' : 'entity_npc');
-                if (sprite) {
-                    ctx.drawImage(sprite, n.x - sprite.width/2, n.y - sprite.height/2);
-                    if (n.type !== 'shrine') {
-                        const hand = this.spriteCache.get('entity_npc_hand');
-                        if (hand) {
-                            const wave = Math.sin(this.frameCounter * 0.1) * 3;
-                            ctx.drawImage(hand, n.x - 12, n.y + 2 + wave);
-                            ctx.drawImage(hand, n.x + 8, n.y + 2 - wave);
-                        }
-                    }
-                } else {
-                    ctx.fillStyle = n.type === 'shrine' ? '#fff' : (n.type === 'merchant' ? '#aaa' : '#888'); 
-                    ctx.fillText(n.type === 'shrine' ? "H" : (n.type === 'merchant' ? "V" : "P"), n.x, n.y);
+                this.render.drawChest(c.x, c.y, this.frameCounter * 0.05);
+                if (Utils.dist(this.player, c) < 30) {
+                    // Желтая обводка
+                    ctx.strokeStyle = '#ff0';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(c.x - 12, c.y - 14, 24, 28);
+                    ctx.font = '14px "IBM Plex Mono"';
+                    ctx.fillText("[E] Сундук", c.x, c.y - 20);
+                    ctx.font = 'bold 20px "IBM Plex Mono"';
                 }
-                if (Utils.dist(this.player, n) < 40) { ctx.font = '14px "IBM Plex Mono"'; ctx.fillText(`[E] ${n.type === 'shrine' ? "Алтарь" : "Говорить"}`, n.x, n.y - 15); ctx.font = 'bold 20px "IBM Plex Mono"'; }
             }
         });
-        this.enemies.forEach(e => {
-            if (isMapFull || this.isCellVisible(Math.floor(e.x/TILE_SIZE), Math.floor(e.y/TILE_SIZE)) || this.ui.state.seeAllEnemies) {
-                this.render.drawShadow(e.x, e.y + 8, 10);
-                if (e.anim) {
-                    if (e.type === 'shooter') {
-                        const state = e.fsm.state.value;
-                        if (state === 'attack' || state === 'chase') (e.anim as any).def = ANIMATIONS.ENEMY_SHOOTER_ATTACK;
-                        else (e.anim as any).def = ANIMATIONS.ENEMY_SHOOTER_IDLE;
-                    }
-                    e.anim.draw(this.ctx, this.spriteCache, e.x, e.y);
+        this.trapState.pits.forEach(p => {
+            if (!isMapFull && !this.isCellVisible(Math.floor(p.x / TILE_SIZE), Math.floor(p.y / TILE_SIZE))) return;
+            this.render.drawPit(p.x, p.y, this.frameCounter * 0.05);
+        });
+        this.trapState.spikes.forEach(s => {
+            if (!isMapFull && !this.isCellVisible(Math.floor(s.x / TILE_SIZE), Math.floor(s.y / TILE_SIZE))) return;
+            // s.state === 2 означает что шипы полностью выдвинуты (активны)
+            const isActive = s.state === 2;
+            this.render.drawSpikeTrap(s.x, s.y, this.frameCounter * 0.05, isActive);
+        });
+        this.trapState.plates.forEach(p => {
+            if (!isMapFull && !this.isCellVisible(Math.floor(p.x / TILE_SIZE), Math.floor(p.y / TILE_SIZE))) return;
+            this.render.drawPressurePlate(p.x, p.y, p.pressed);
+        });
+
+        // bitECS NPCs
+        const npcs = npcQuery(this.world);
+        for (let i = 0; i < npcs.length; i++) {
+            const eid = npcs[i];
+            const n = this.npcsMap.get(eid)!;
+            const nx = Position.x[eid], ny = Position.y[eid];
+            if (isMapFull || this.isCellVisible(Math.floor(nx/TILE_SIZE), Math.floor(ny/TILE_SIZE))) {
+                if (n.type === 'shrine') {
+                    this.render.drawShadow(nx, ny + 8, 10);
+                    const sprite = this.spriteCache.get('obj_altar');
+                    if (sprite) ctx.drawImage(sprite, nx - sprite.width/2, ny - sprite.height/2);
                 } else {
-                    ctx.fillStyle = e.type === 'shooter' ? '#ddd' : '#fff';
-                    ctx.fillText(e.type === 'shooter' ? 'S' : 'C', e.x, e.y);
+                    this.render.drawShadow(nx, ny + 8, 10);
+                    this.render.drawNPC(nx, ny, this.frameCounter * 0.05);
+                }
+                if (Utils.dist(this.player, {x: nx, y: ny}) < 40) {
+                    ctx.strokeStyle = '#ff0'; ctx.lineWidth = 2; ctx.strokeRect(nx - 12, ny - 18, 24, 36);
+                    ctx.font = '14px "IBM Plex Mono"'; ctx.fillText(`[E] ${n.type === 'shrine' ? "Алтарь" : "Говорить"}`, nx, ny - 25); ctx.font = 'bold 20px "IBM Plex Mono"';
+                }
+            }
+        }
+
+        this.torches.forEach(t => {
+            if (isMapFull || this.isCellVisible(t.gx, t.gy)) {
+                const isLit = t.lit !== false;
+                const isNear = Utils.dist(this.player, {x: t.x, y: t.y}) < 40;
+                if (isNear) { ctx.strokeStyle = '#ff0'; ctx.lineWidth = 2; ctx.strokeRect(t.x - 10, t.y - 14, 20, 28); }
+                this.render.drawShadow(t.x, t.y + 8, 10);
+                const torchSprite = this.spriteCache.get('object_torch');
+                if (torchSprite) ctx.drawImage(torchSprite, t.x - torchSprite.width/2, t.y - torchSprite.height/2);
+                if (isLit) {
+                    const flameSprite = this.spriteCache.get(this.frameCounter % 8 < 4 ? 'object_torch_flame_1' : 'object_torch_flame_2');
+                    if (flameSprite) ctx.drawImage(flameSprite, t.x - flameSprite.width/2, t.y - flameSprite.height/2 - 6);
+                }
+                if (isNear) {
+                    ctx.font = '14px "IBM Plex Mono"'; ctx.fillStyle = '#ff0'; ctx.fillText(isLit ? "[E] Потушить" : "[E] Зажечь", t.x, t.y - 20); ctx.font = 'bold 20px "IBM Plex Mono"';
+                }
+            }
+        });
+
+        // bitECS Enemies
+        const enemies = enemyQuery(this.world);
+        const thermalRadius = TILE_SIZE * 15;
+        for (let i = 0; i < enemies.length; i++) {
+            const eid = enemies[i];
+            const e = this.enemiesMap.get(eid)!;
+            const ex = Position.x[eid], ey = Position.y[eid];
+            const isVisible = this.isCellVisible(Math.floor(ex/TILE_SIZE), Math.floor(ey/TILE_SIZE));
+            const inThermalRange = this.player.hasThermal && Utils.dist(this.player, {x: ex, y: ey}) <= thermalRadius;
+            
+            if (isMapFull || isVisible || this.ui.state.seeAllEnemies || inThermalRange) {
+                this.render.drawShadow(ex, ey + 8, 10);
+                
+                const debugFov = Math.PI / 2.2;
+                const debugAngle = e.angle || 0;
+                ctx.save();
+                ctx.beginPath(); ctx.moveTo(ex, ey); ctx.arc(ex, ey, e.detectionRange, debugAngle - debugFov/2, debugAngle + debugFov/2); ctx.closePath();
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.05)'; ctx.fill();
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)'; ctx.stroke();
+                ctx.restore();
+
+                if (e.type === 'chaser') {
+                    const isActive = e.fsm && (e.fsm.state.value === 'chase' || e.fsm.state.value === 'attacking' || e.fsm.state.value === 'alerting');
+                    this.render.drawSlime(ex, ey, this.frameCounter * 0.05, isActive);
+                } else if (e.type === 'shooter') {
+                    this.render.drawSpikySlime(ex, ey, this.frameCounter * 0.05);
+                } else if (e.anim) {
+                    this.render.drawAnimatedSpriteWithShade(e.anim, this.spriteCache, ex, ey, 0.85);
+                } else {
+                    ctx.fillStyle = '#ddd'; ctx.fillText('?', ex, ey);
                 }
 
                 const state = e.fsm.state.value;
                 if (state === 'alerting') { 
-                    const progress = 1 - (e.alertTimer / 60); ctx.fillStyle = '#fff'; ctx.fillRect(e.x - 10, e.y - 15, 20 * progress, 4); 
+                    const progress = 1 - (e.alertTimer / 60); ctx.fillStyle = '#fff'; ctx.fillRect(ex - 10, ey - 15, 20 * progress, 4); 
                     const alertSprite = this.spriteCache.get('entity_alert');
-                    if (alertSprite) this.ctx.drawImage(alertSprite, e.x - alertSprite.width/2, e.y - 25);
+                    if (alertSprite) this.ctx.drawImage(alertSprite, ex - alertSprite.width/2, ey - 25);
                 }
-                if (e.barkTimer > 0) { ctx.font = '14px "IBM Plex Mono"'; ctx.fillText(e.barkText, e.x, e.y - 20); ctx.font = 'bold 20px "IBM Plex Mono"'; }
+                if (e.barkTimer > 0) { ctx.font = '14px "IBM Plex Mono"'; ctx.fillText(e.barkText, ex, ey - 20); ctx.font = 'bold 20px "IBM Plex Mono"'; }
             }
-        });
-        this.barrels.forEach(b => { 
+        }
+        this.barrels.forEach(b => {
             if (isMapFull || this.isCellVisible(Math.floor(b.x/TILE_SIZE), Math.floor(b.y/TILE_SIZE))) {
                 this.render.drawShadow(b.x, b.y + 8, 12);
-                const sprite = this.spriteCache.get('obj_barrel');
-                if (sprite) ctx.drawImage(sprite, b.x - sprite.width/2, b.y - sprite.height/2);
-                else { ctx.fillStyle = '#fff'; let ch = b.type === 'water' ? '[В]' : (b.type === 'oil' ? '[М]' : '[*]'); ctx.fillText(ch, b.x, b.y); }
-                if (Utils.dist(this.player, b) < 30 && !this.player.carryingBarrel) { ctx.font = '14px "IBM Plex Mono"'; ctx.fillText("[E] Поднять", b.x, b.y - 15); ctx.font = 'bold 20px "IBM Plex Mono"'; }
+                this.render.drawBarrel(b.x, b.y);
+                if (Utils.dist(this.player, b) < 30 && !this.player.carryingBarrel) {
+                    // Желтая обводка
+                    ctx.strokeStyle = '#ff0';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(b.x - 12, b.y - 16, 24, 32);
+                    ctx.font = '14px "IBM Plex Mono"';
+                    ctx.fillText("[E] Поднять", b.x, b.y - 20);
+                    ctx.font = 'bold 20px "IBM Plex Mono"';
+                }
             } 
         });
         this.doors.forEach(d => { 
@@ -1514,19 +1953,11 @@ class Game {
         });
 
         ctx.fillStyle = '#fff';
-        if (this.player.anim) {
-            const flipX = this.input.mouse.x < this.player.x;
-            let scaleX = 1, scaleY = 1;
-            if (this.player.isDashing) { scaleX = 1.4; scaleY = 0.6; }
-            this.render.drawShadow(this.player.x, this.player.y + 8, 10);
-            this.player.anim.draw(this.ctx, this.spriteCache, this.player.x, this.player.y, flipX, scaleX, scaleY);
-        } else {
-            this.render.drawShadow(this.player.x, this.player.y + 8, 10);
-            ctx.fillText("@", this.player.x, this.player.y);
-        }
+        this.render.drawShadow(this.player.x, this.player.y + 8, 10);
+        this.render.drawHuman(this.player.x, this.player.y, this.player.angle, this.player.isDashing, this.player.godMode || false, this.gameState, this.frameCounter * 0.05);
 
         if (this.player.carryingBarrel) { ctx.font = '14px "IBM Plex Mono"'; let ch = this.player.carryingBarrel === 'water' ? '[В]' : (this.player.carryingBarrel === 'oil' ? '[М]' : '[*]'); ctx.fillText(ch, this.player.x, this.player.y - 20); ctx.font = 'bold 20px "IBM Plex Mono"'; }
-        
+
         this.floatingTexts.forEach(ft => { ctx.globalAlpha = ft.life / 60; ctx.fillStyle = ft.color; ctx.fillText(ft.text, ft.x, ft.y); ctx.globalAlpha = 1.0; });
         if (this.roomClearTimer > 0) { ctx.fillStyle = '#fff'; ctx.font = 'bold 24px "IBM Plex Mono"'; ctx.fillText("КОМНАТА ЗАЧИЩЕНА. ИДИТЕ К ВЫХОДУ.", GAME_WIDTH/2, GAME_HEIGHT/2 - 40); ctx.font = 'bold 20px "IBM Plex Mono"'; }
     }
@@ -1542,81 +1973,115 @@ class Game {
         ctx.scale(0.8 + 0.2 * progress, 0.8 + 0.2 * progress);
         ctx.translate(-GAME_WIDTH/2, -GAME_HEIGHT/2);
 
-        const gridX = (GAME_WIDTH - 8 * 30) / 2;
-        const gridY = (GAME_HEIGHT - 6 * 30) / 2 + (this.gameState === 'CHEST' ? 60 : 0);
+        // Horizontal layout: Chest left, Inventory right (same Y level)
+        const chestX = this.gameState === 'CHEST' ? (GAME_WIDTH / 2 - 320) : 0;
+        const invX = GAME_WIDTH / 2 + 20;
+        const gridY = (GAME_HEIGHT - 6 * 30) / 2;
         
-        // Draw Chest Window
+        // Draw Chest Window (left side)
         if (this.gameState === 'CHEST' && this.activeChest) {
-            const cGridX = (GAME_WIDTH - 8 * 30) / 2;
-            const cGridY = (GAME_HEIGHT - 6 * 30) / 2 - 140;
-            
             ctx.fillStyle = '#181818'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
-            ctx.fillRect(cGridX - 20, cGridY - 40, 8 * 30 + 40, 6 * 30 + 100);
-            ctx.strokeRect(cGridX - 20, cGridY - 40, 8 * 30 + 40, 6 * 30 + 100);
+            ctx.fillRect(chestX - 20, gridY - 40, 8 * 30 + 40, 6 * 30 + 100);
+            ctx.strokeRect(chestX - 20, gridY - 40, 8 * 30 + 40, 6 * 30 + 100);
             
             ctx.fillStyle = '#fff'; ctx.font = 'bold 16px "IBM Plex Mono"'; ctx.textAlign = 'left';
-            ctx.fillText("СОДЕРЖИМОЕ СУНДУКА", cGridX, cGridY - 15);
+            ctx.fillText("СОДЕРЖИМОЕ СУНДУКА", chestX, gridY - 15);
             
             // Grid
             ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
-            for(let r=0; r<6; r++) for(let c=0; c<8; c++) ctx.strokeRect(cGridX + c*30, cGridY + r*30, 30, 30);
+            for(let r=0; r<6; r++) for(let c=0; c<8; c++) ctx.strokeRect(chestX + c*30, gridY + r*30, 30, 30);
             
             this.activeChest.items.forEach(item => {
                 if (this.draggingItem === item) return;
                 const db = ITEMS_DB[item.id];
                 ctx.fillStyle = this.selectedItemInstanceId === item.instanceId ? '#fff' : '#888';
-                db.shape.forEach((row, ri) => row.forEach((cell, ci) => { if (cell) ctx.fillRect(cGridX + (item.x + ci)*30 + 2, cGridY + (item.y + ri)*30 + 2, 26, 26); }));
+                db.shape.forEach((row, ri) => row.forEach((cell, ci) => { if (cell) ctx.fillRect(chestX + (item.x + ci)*30 + 2, gridY + (item.y + ri)*30 + 2, 26, 26); }));
             });
 
-            // Chest Buttons
+            // Close Button
             const mouse = this.input.mouse;
-            const hTake = mouse.y > cGridY + 6 * 30 + 10 && mouse.y < cGridY + 6 * 30 + 40 && mouse.x > cGridX && mouse.x < cGridX + 120;
-            const hRefuse = mouse.y > cGridY + 6 * 30 + 10 && mouse.y < cGridY + 6 * 30 + 40 && mouse.x > cGridX + 130 && mouse.x < cGridX + 240;
-            
-            ctx.fillStyle = hTake ? '#fff' : '#000'; ctx.fillRect(cGridX, cGridY + 6*30 + 10, 120, 30);
-            ctx.strokeStyle = '#fff'; ctx.strokeRect(cGridX, cGridY + 6*30 + 10, 120, 30);
-            ctx.fillStyle = hTake ? '#000' : '#fff'; ctx.textAlign = 'center'; ctx.fillText("ЗАБРАТЬ ВСЕ", cGridX + 60, cGridY + 6*30 + 30);
-            
-            ctx.fillStyle = hRefuse ? '#fff' : '#000'; ctx.fillRect(cGridX + 130, cGridY + 6*30 + 10, 110, 30);
-            ctx.strokeStyle = '#fff'; ctx.strokeRect(cGridX + 130, cGridY + 6*30 + 10, 110, 30);
-            ctx.fillStyle = hRefuse ? '#000' : '#fff'; ctx.fillText("ОТКАЗАТЬСЯ", cGridX + 130 + 55, cGridY + 6*30 + 30);
+            const hClose = mouse.y > gridY + 6 * 30 + 10 && mouse.y < gridY + 6 * 30 + 40 && mouse.x > chestX + 70 && mouse.x < chestX + 190;
+
+            ctx.fillStyle = hClose ? '#fff' : '#000'; ctx.fillRect(chestX + 70, gridY + 6*30 + 10, 120, 30);
+            ctx.strokeStyle = '#fff'; ctx.strokeRect(chestX + 70, gridY + 6*30 + 10, 120, 30);
+            ctx.fillStyle = hClose ? '#000' : '#fff'; ctx.textAlign = 'center'; ctx.fillText("ЗАКРЫТЬ", chestX + 70 + 60, gridY + 6*30 + 30);
         }
 
-        // Draw Player Inventory Window
+        // Draw Player Inventory Window (right side)
         ctx.fillStyle = '#111'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
-        ctx.fillRect(gridX - 20, gridY - 40, 8 * 30 + 140, 6 * 30 + 60);
-        ctx.strokeRect(gridX - 20, gridY - 40, 8 * 30 + 140, 6 * 30 + 60);
+        ctx.fillRect(invX - 20, gridY - 40, 8 * 30 + 140, 6 * 30 + 60);
+        ctx.strokeRect(invX - 20, gridY - 40, 8 * 30 + 140, 6 * 30 + 60);
         ctx.fillStyle = '#fff'; ctx.font = 'bold 16px "IBM Plex Mono"'; ctx.textAlign = 'left';
-        ctx.fillText("РЮКЗАК ИГРОКА", gridX, gridY - 15);
+        ctx.fillText("РЮКЗАК ИГРОКА", invX, gridY - 15);
         
         ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
-        for (let r = 0; r < 6; r++) for (let c = 0; c < 8; c++) ctx.strokeRect(gridX + c * 30, gridY + r * 30, 30, 30);
+        for (let r = 0; r < 6; r++) for (let c = 0; c < 8; c++) ctx.strokeRect(invX + c * 30, gridY + r * 30, 30, 30);
         
         this.inventoryItems.forEach(item => {
             if (this.draggingItem === item) return;
             const db = ITEMS_DB[item.id];
             const isSelected = this.selectedItemInstanceId === item.instanceId;
             ctx.fillStyle = isSelected ? '#fff' : '#888';
-            db.shape.forEach((row, ri) => row.forEach((cell, ci) => { if (cell) ctx.fillRect(gridX + (item.x + ci)*30 + 2, gridY + (item.y + ri)*30 + 2, 26, 26); }));
-            if (this.player.equippedWeaponInstanceId === item.instanceId) { ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.strokeRect(gridX + item.x*30, gridY + item.y*30, 30, 30); ctx.lineWidth = 1; }
+            db.shape.forEach((row, ri) => row.forEach((cell, ci) => { if (cell) ctx.fillRect(invX + (item.x + ci)*30 + 2, gridY + (item.y + ri)*30 + 2, 26, 26); }));
+            if (this.player.equippedWeaponInstanceId === item.instanceId) { ctx.strokeStyle = '#0f0'; ctx.lineWidth = 2; ctx.strokeRect(invX + item.x*30, gridY + item.y*30, 30, 30); ctx.lineWidth = 1; }
         });
-        const hoveredItem = this.inventoryItems.find(it => it.instanceId === this.selectedItemInstanceId);
         
-        // Detailed Item View
+        // Item tooltip popup - shows for selected item from either chest or inventory
+        let hoveredItem: any = null;
+        let hoveredSource: 'chest' | 'inventory' | null = null;
+        let hoveredX = 0;
+        
+        // Check inventory item
+        const invItem = this.inventoryItems.find(it => it.instanceId === this.selectedItemInstanceId);
+        if (invItem && this.draggingItemSource !== 'chest') {
+            hoveredItem = invItem;
+            hoveredSource = 'inventory';
+            hoveredX = invX;
+        }
+        // Check chest item
+        else if (this.gameState === 'CHEST' && this.activeChest) {
+            const chestItem = this.activeChest.items.find(it => it.instanceId === this.selectedItemInstanceId);
+            if (chestItem) {
+                hoveredItem = chestItem;
+                hoveredSource = 'chest';
+                hoveredX = chestX;
+            }
+        }
+        
+        // Draw item info tooltip at bottom center
         if (hoveredItem && !this.draggingItem) {
             const db = ITEMS_DB[hoveredItem.id];
-            ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.font = 'bold 18px "IBM Plex Mono"'; ctx.fillText(db.name.toUpperCase(), gridX + 8*30 + 20, gridY + 110);
+            const tipX = GAME_WIDTH / 2 - 100;
+            const tipY = gridY + 6 * 30 + 80;
             
-            const bx = gridX + 8 * 30 + 20;
-            const by = gridY;
-            if (db.type === 'weapon') {
-                ctx.fillStyle = (this.player.equippedWeaponInstanceId === hoveredItem.instanceId) ? '#444' : '#000'; ctx.fillRect(bx, by, 100, 30);
-                ctx.strokeStyle = '#fff'; ctx.strokeRect(bx, by, 100, 30);
-                ctx.fillStyle = '#fff'; ctx.font = '14px "IBM Plex Mono"'; ctx.textAlign = 'center'; ctx.fillText(this.player.equippedWeaponInstanceId === hoveredItem.instanceId ? "СНЯТЬ" : "ЭКИПИР.", bx + 50, by + 20);
+            // Tooltip background
+            ctx.fillStyle = '#000'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+            ctx.fillRect(tipX, tipY, 200, 60);
+            ctx.strokeRect(tipX, tipY, 200, 60);
+            
+            // Item name
+            ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 14px "IBM Plex Mono"';
+            ctx.fillText(db.name.toUpperCase(), tipX + 100, tipY + 25);
+            
+            // Item description
+            ctx.fillStyle = '#aaa'; ctx.font = '12px "IBM Plex Mono"';
+            ctx.fillText(db.desc.substring(0, 35), tipX + 100, tipY + 45);
+            
+            // Action buttons (only for inventory items)
+            if (hoveredSource === 'inventory') {
+                const bx = invX + 8 * 30 + 20;
+                const by = gridY;
+                if (db.type === 'weapon') {
+                    ctx.fillStyle = (this.player.equippedWeaponInstanceId === hoveredItem.instanceId) ? '#444' : '#000';
+                    ctx.fillRect(bx, by, 100, 30);
+                    ctx.strokeStyle = '#fff'; ctx.strokeRect(bx, by, 100, 30);
+                    ctx.fillStyle = '#fff'; ctx.font = '14px "IBM Plex Mono"'; ctx.textAlign = 'center';
+                    ctx.fillText(this.player.equippedWeaponInstanceId === hoveredItem.instanceId ? "СНЯТЬ" : "ЭКИПИР.", bx + 50, by + 20);
+                }
+                ctx.fillStyle = '#000'; ctx.fillRect(bx, by + 40, 100, 30);
+                ctx.strokeStyle = '#fff'; ctx.strokeRect(bx, by + 40, 100, 30);
+                ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.fillText("УНИЧТОЖИТЬ", bx + 50, by + 60);
             }
-            ctx.fillStyle = '#000'; ctx.fillRect(bx, by + 40, 100, 30);
-            ctx.strokeStyle = '#fff'; ctx.strokeRect(bx, by + 40, 100, 30);
-            ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.fillText("УНИЧТОЖИТЬ", bx + 50, by + 60);
         }
 
         // Dragging Item
@@ -1675,7 +2140,13 @@ class Game {
         if (targetId !== null) {
             let node = this.globalMap.nodes[targetId];
             document.getElementById('niTitle')!.innerText = node.type.toUpperCase();
-            document.getElementById('niDesc')!.innerText = "Место испытаний и опасностей.";
+            const descriptions: Record<string, string> = {
+                simple: "Место испытаний и опасностей.",
+                merchant: "Торговец со снаряжением.",
+                shrine: "Алтарь благословений.",
+                boss: "Арена битвы с боссом."
+            };
+            document.getElementById('niDesc')!.innerText = descriptions[node.type] || descriptions.simple;
             document.getElementById('niStatus')!.innerText = node.status.toUpperCase();
             nodeInfo.style.display = 'block';
         } else nodeInfo.style.display = 'none';
@@ -1684,7 +2155,7 @@ class Game {
     private loop = () => {
         this.update();
         this.draw();
-        requestAnimationFrame(this.loop);
+        this.animationFrameId = requestAnimationFrame(this.loop);
     }
 
     private addFloatingText(x: number, y: number, text: string, color = '#fff') {
@@ -1692,18 +2163,39 @@ class Game {
     }
 
     private makeNoise(nx: number, ny: number, radius: number) {
-        this.enemies.forEach(en => {
-            if ((en.fsm.state.value === 'patrol' || en.fsm.state.value === 'investigate') && Utils.distSq({x: nx, y: ny}, en) < radius*radius) {
-                en.memory = { x: Math.floor(nx/TILE_SIZE), y: Math.floor(ny/TILE_SIZE) };
-                en.fsm.send('HEARD_NOISE');
-                this.addFloatingText(en.x, en.y - 20, "?!", "#ff0");
+        const enemies = enemyQuery(this.world);
+        for (let i = 0; i < enemies.length; i++) {
+            const eid = enemies[i];
+            const en = this.enemiesMap.get(eid)!;
+            const state = en.fsm.state.value;
+            // Only non-combat enemies accumulate noise
+            if (state === 'patrol' || state === 'investigate') {
+                const dist = Utils.dist({x: nx, y: ny}, {x: Position.x[eid], y: Position.y[eid]});
+                if (dist < radius) {
+                    const wallCount = this.countWallsBetween(nx, ny, Position.x[eid], Position.y[eid]);
+                    const dampening = Math.pow(0.5, wallCount); // Walls block noise
+                    
+                    const intensity = (1 - dist / radius) * 50 * dampening;
+                    
+                    en.noisePosition = { x: nx, y: ny };
+                    if (updateNoise(en, intensity)) {
+                        // Threshold reached (100%)
+                        updateMemory(en, { x: Position.x[this.player.eid], y: Position.y[this.player.eid] });
+                        // Transition to investigate is handled in updateEnemies loop
+                        this.addFloatingText(Position.x[eid], Position.y[eid] - 20, "!!!", "#f00");
+                    } else if (intensity > 5) {
+                        this.addFloatingText(Position.x[eid], Position.y[eid] - 20, "?", "#ff0");
+                    }
+                }
             }
-        });
+        }
     }
 
     private destroyBarrel(index: number) {
         const brl = this.barrels.splice(index, 1)[0];
         if (!brl) return;
+        // Remove from obstacles
+        this.obstacles = this.obstacles.filter(o => !(o.type === 'barrel' && o.id === brl.id));
         sfx.hit();
         
         if (brl.type === 'explosive') {
@@ -1721,8 +2213,10 @@ class Game {
             this.particles.spawn(brl.x, brl.y, 60, 2, 6); // Large sparks on barrel explosion
             this.makeNoise(brl.x, brl.y, 500);
             if (!this.ui.state.godMode && !this.player.isDashing && Utils.dist(this.player, brl) < 60) this.restartRoom();
-            for (let j = this.enemies.length - 1; j >= 0; j--) {
-                if (Utils.dist(this.enemies[j], brl) < 60) this.killEnemy(j);
+            const enemies = enemyQuery(this.world);
+            for (let j = enemies.length - 1; j >= 0; j--) {
+                const eid = enemies[j];
+                if (Utils.dist({x: Position.x[eid], y: Position.y[eid]}, brl) < 60) this.killEnemy(eid);
             }
             this.fluids.ignite(Math.floor(brl.x/TILE_SIZE), Math.floor(brl.y/TILE_SIZE), (x, y) => this.makeNoise(x, y, 400));
         } else {
@@ -1733,39 +2227,102 @@ class Game {
     private setSecretRoomOpen(open: boolean) { this.secretRoomOpen = open; this.updateStaticLayer(); }
     
     private restartRoom() {
-        if (this.ui.state.godMode || this.isRestarting) return;
+        if (this.ui.state.godMode || this.isRestarting || this.deathAnimTimer > 0 || this.isDead) return;
         this.isRestarting = true;
-        this.currentWill -= 1;
-        this.addFloatingText(this.player.x, this.player.y - 40, "ВОЛЯ ПОТЕРЯНА!", "#f00");
-        if (this.currentWill <= 0) { this.gameState = 'GAME_OVER'; sfx.gameOver(); }
-        else {
-            this.inventoryItems = this.roomSnapshot.inventoryItems.map((it:any) => ({...it}));
-            this.enemies = this.roomSnapshot.enemies.map((e:any) => ({...e, fsm: interpret(enemyMachineDef).start(), memory: null, alertTimer: 0, barkTimer: 0}));
-            this.trapState = JSON.parse(JSON.stringify(this.roomSnapshot.trapState));
-            this.chests = JSON.parse(JSON.stringify(this.roomSnapshot.chests));
-            this.npcs = JSON.parse(JSON.stringify(this.roomSnapshot.npcs));
-            this.bullets = [];
-            this.player.x = GAME_WIDTH / 2; this.player.y = 520; this.player.carryingBarrel = null;
-            this.gameState = 'PLAYING';
-            this.roomActive = false;
-            this.isRestarting = false;
-            this.doors = [];
-            if (this.startDoor) this.startDoor.open = false;
-            this.updateStaticLayer();
+        // Chalice: 50% chance to not lose will
+        if (this.player.hasChalice && Math.random() < 0.5) {
+            this.addFloatingText(this.player.x, this.player.y - 40, "ЧАША ЗАЩИТИЛА ВОЛЮ!", "#ff0");
+        } else {
+            this.currentWill -= 1;
         }
+        if (this.currentWill <= 0) { this.gameState = 'GAME_OVER'; sfx.gameOver(); this.isRestarting = false; }
+        else {
+            // Mark as dead and show R to restart message
+            this.isDead = true;
+            sfx.hit();
+            
+            // Clear all AI targets and memories immediately
+            for (let e of this.enemiesMap.values()) {
+                if (e.fsm) e.fsm.send('PLAYER_LOST');
+                clearMemory(e);
+            }
+
+            // Spawn blood particles
+            this.particles.spawnBlood(this.player.x, this.player.y, 20);
+        }
+        this.isRestarting = false;
+    }
+
+    private triggerRestartAnimation() {
+        if (!this.isDead) return;
+        this.isDead = false;
+        this.deathAnimTimer = 120;
+    }
+
+    private finishRestartRoom() {
+        // Restore room state after death animation
+        this.inventoryItems = this.roomSnapshot.inventoryItems.map((it:any) => ({...it}));
+        
+        // Clear bitECS world of enemies/npcs
+        const enemies = enemyQuery(this.world);
+        enemies.forEach(eid => bitECS.removeEntity(this.world, eid));
+        this.enemiesMap.clear();
+
+        const npcs = npcQuery(this.world);
+        npcs.forEach(eid => bitECS.removeEntity(this.world, eid));
+        this.npcsMap.clear();
+
+        this.roomSnapshot.enemies.forEach((eData:any) => {
+            const en = this.spawnEnemy(eData.type, eData.x, eData.y, eData.role);
+            en.angle = eData.angle || 0;
+            if (eData.patrolPath) en.patrolPath = eData.patrolPath;
+        });
+
+        this.roomSnapshot.npcs.forEach((nData:any) => {
+            this.spawnNPC(nData.type, nData.x, nData.y);
+        });
+
+        this.player.x = GAME_WIDTH / 2; this.player.y = 520; 
+        Position.x[this.player.eid] = this.player.x;
+        Position.y[this.player.eid] = this.player.y;
+        this.player.trail = []; this.player.carryingBarrel = null;
+        this.player.status = null; this.player.statusTimer = 0;
+        this.isDead = false;
+        
+        if (this.player.equippedWeaponInstanceId) {
+            const weapon = this.inventoryItems.find(it => it.instanceId === this.player.equippedWeaponInstanceId);
+            if (!weapon) this.player.equippedWeaponInstanceId = null;
+        }
+        this.player.ammo = this.player.computedStats.maxAmmo;
+        this.player.isReloading = false; this.player.reloadTimer = 0;
+        this.trapState = { ...this.roomSnapshot.trapState };
+        this.barrels = this.roomSnapshot.barrels.map((b:any) => ({...b}));
+        this.bullets = []; this.particles.reset(); this.fluids.reset();
+        this.secretRoomOpen = false;
+        this.secretDoors = this.roomSnapshot.secretDoors ? [...this.roomSnapshot.secretDoors] : [];
+        this.secretDoorObstacles = this.roomSnapshot.secretDoorObstacles ? [...this.roomSnapshot.secretDoorObstacles] : [];
+        this.obstacles = this.roomSnapshot.obstacles ? [...this.roomSnapshot.obstacles] : [];
+        this.chests = this.roomSnapshot.chests.map((c:any) => ({...c, items: c.items.map((it:any) => ({...it}))}));
+        this.doors = [];
+        if (this.startDoor) this.startDoor.open = false;
+        this.roomActive = false;
+        this.gameState = 'PLAYING';
         this.updateEquippedStats();
+        this.updateStaticLayer();
+        this.addFloatingText(this.player.x, this.player.y - 20, "НОВАЯ ПОПЫТКА", "#fff");
         this.updateUI();
     }
-    
-    private killEnemy(index: number) { 
-        const e = this.enemies[index];
+
+    private killEnemy(eid: number) { 
+        const e = this.enemiesMap.get(eid);
         if (!e) return;
-        this.particles.spawn(e.x, e.y, 15, 2, 3); // Sparks on kill
-        this.enemies.splice(index, 1); 
+        this.particles.spawn(Position.x[eid], Position.y[eid], 15, 2, 3); // Sparks on kill
+        bitECS.removeEntity(this.world, eid);
+        this.enemiesMap.delete(eid);
         sfx.hit(); 
     }
     
-    private updateUI() { 
+    private updateUI() {
         this.ui.update(this.roomLevel, `${this.player.ammo}/${this.player.computedStats.maxAmmo}`, this.player.credits);
         
         // Обновляем HTML HUD элементы
@@ -1800,6 +2357,53 @@ class Game {
                 healthBar.appendChild(heart);
             }
         }
+    }
+
+    private spawnEnemy(type: 'shooter' | 'chaser', x: number, y: number, role: 'guard' | 'patroller' | 'follower' | 'wanderer' = 'wanderer') {
+        const eid = bitECS.addEntity(this.world);
+        bitECS.addComponent(this.world, EnemyTag, eid);
+        bitECS.addComponent(this.world, Position, eid);
+        bitECS.addComponent(this.world, Health, eid);
+        bitECS.addComponent(this.world, Velocity, eid);
+
+        const db = ENEMIES_DB[type === 'shooter' ? 'sniper' : 'grunt'];
+        Position.x[eid] = x;
+        Position.y[eid] = y;
+        Health.current[eid] = db.health;
+        Health.max[eid] = db.health;
+
+        const enemy: Enemy = {
+            id: eid, x, y, radius: 12,
+            type, role, speed: db.speed, health: db.health, maxHealth: db.health,
+            fsm: interpret(enemyMachineDef).start(), lastKnownPosition: null, barkText: "", barkTimer: 0,
+            angle: Math.random() * Math.PI * 2,
+            alertTimer: 0, status: null, statusTimer: 0, patrolIndex: 0, followOffX: 0, followOffY: 0,
+            memoryTimer: 0, shootTimer: 0, detectionRange: db.detectionRange, noiseLevel: 0, noisePosition: null,
+            onShoot: (sx, sy, angle) => {
+                this.bullets.push({
+                    id: Math.random(), x: sx, y: sy, vx: Math.cos(angle)*4, vy: Math.sin(angle)*4, radius: 3,
+                    isEnemy: true, damage: 1, type: 'enemy', lifetime: 180
+                });
+                lumen.addLight({
+                    id: `enemy_muzzle_${eid}_${this.frameCounter}`,
+                    x: Math.floor(sx/TILE_SIZE), y: Math.floor(sy/TILE_SIZE),
+                    radius: 3, intensity: 0.5, type: LightType.TEMPORARY, active: true, ttl: 15
+                });
+            }
+        };
+        this.enemiesMap.set(eid, enemy);
+        return enemy;
+    }
+
+    private spawnNPC(type: 'merchant' | 'shrine' | 'civilian', x: number, y: number) {
+        const eid = bitECS.addEntity(this.world);
+        let npc: any;
+        if (type === 'merchant') npc = createMerchant(this.world, eid, x, y);
+        else if (type === 'shrine') npc = createAltar(this.world, eid, x, y);
+        else npc = createCivilian(this.world, eid, x, y);
+        
+        this.npcsMap.set(eid, npc);
+        return npc;
     }
 }
 

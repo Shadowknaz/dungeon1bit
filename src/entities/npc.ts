@@ -1,3 +1,6 @@
+import { addComponent, IWorld } from 'bitecs';
+import { Position, NpcTag } from '../components';
+
 export interface DialogOption {
     text: string;
     next?: DialogNode;
@@ -18,7 +21,11 @@ export interface NPCState {
     currentNode: DialogNode | null;
 }
 
-export function createMerchant(x: number, y: number): NPCState {
+export function createMerchant(world: IWorld, eid: number, x: number, y: number): NPCState {
+    addComponent(world, NpcTag, eid);
+    addComponent(world, Position, eid);
+    Position.x[eid] = x;
+    Position.y[eid] = y;
     return {
         x, y,
         radius: 10,
@@ -34,7 +41,11 @@ export function createMerchant(x: number, y: number): NPCState {
     };
 }
 
-export function createAltar(x: number, y: number): NPCState {
+export function createAltar(world: IWorld, eid: number, x: number, y: number): NPCState {
+    addComponent(world, NpcTag, eid);
+    addComponent(world, Position, eid);
+    Position.x[eid] = x;
+    Position.y[eid] = y;
     return {
         x, y,
         radius: 15,
@@ -50,7 +61,11 @@ export function createAltar(x: number, y: number): NPCState {
     };
 }
 
-export function createCivilian(x: number, y: number): NPCState {
+export function createCivilian(world: IWorld, eid: number, x: number, y: number): NPCState {
+    addComponent(world, NpcTag, eid);
+    addComponent(world, Position, eid);
+    Position.x[eid] = x;
+    Position.y[eid] = y;
     const dialogs = [
         "Тут когда-то был сад...",
         "Они пришли из теней.",

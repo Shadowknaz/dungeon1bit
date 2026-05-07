@@ -6,6 +6,7 @@ export interface EnemyType {
     type: 'chaser' | 'shooter';
     char: string;
     color: string;
+    detectionRange: number;
 }
 
 export const ENEMIES_DB: Record<string, EnemyType> = {
@@ -13,10 +14,11 @@ export const ENEMIES_DB: Record<string, EnemyType> = {
         id: 'grunt',
         name: 'Пехотинец',
         health: 20,
-        speed: 0.5,
+        speed: 0.2,
         type: 'chaser',
         char: 'C',
-        color: '#fff'
+        color: '#fff',
+        detectionRange: 160 // 100 * 1.3
     },
     'sniper': {
         id: 'sniper',
@@ -25,7 +27,8 @@ export const ENEMIES_DB: Record<string, EnemyType> = {
         speed: 0.3,
         type: 'shooter',
         char: 'S',
-        color: '#ddd'
+        color: '#ddd',
+        detectionRange: 100 // 100 * 1.3
     },
     'elite': {
         id: 'elite',
@@ -34,6 +37,7 @@ export const ENEMIES_DB: Record<string, EnemyType> = {
         speed: 0.7,
         type: 'chaser',
         char: 'E',
-        color: '#f00'
+        color: '#f00',
+        detectionRange: 130 // 100 * 1.3
     }
 };

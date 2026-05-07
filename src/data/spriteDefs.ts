@@ -30,6 +30,55 @@ export const tile_floor: SpriteDef = {
   ]
 };
 
+// Вариации пола для разнообразия
+export const tile_floor_var1: SpriteDef = {
+  w: 10, h: 10, scale: 2, outline: false,
+  pixels: [
+    0b0000000000,
+    0b0000000000,
+    0b0000100000,
+    0b0000000000,
+    0b0000000100,
+    0b0000000000,
+    0b0000001000,
+    0b0000000000,
+    0b0000000010,
+    0b0000000000,
+  ]
+};
+
+export const tile_floor_var2: SpriteDef = {
+  w: 10, h: 10, scale: 2, outline: false,
+  pixels: [
+    0b0000000000,
+    0b0000000000,
+    0b0010000000,
+    0b0000000000,
+    0b0000010000,
+    0b0000000000,
+    0b0000000100,
+    0b0000000000,
+    0b0000001000,
+    0b0000000000,
+  ]
+};
+
+export const tile_floor_var3: SpriteDef = {
+  w: 10, h: 10, scale: 2, outline: false,
+  pixels: [
+    0b0000000000,
+    0b0000000000,
+    0b0001000000,
+    0b0000000000,
+    0b0000000100,
+    0b0000000000,
+    0b0000010000,
+    0b0000000000,
+    0b0000000001,
+    0b0000000000,
+  ]
+};
+
 export const tile_floor_secret: SpriteDef = {
   w: 10, h: 10, scale: 2, outline: false,
   pixels: [
@@ -76,6 +125,56 @@ export const tile_wall_1111: SpriteDef = {
     0b1000100011,
     0b1111111111,
     0b0011000110,
+    0b1111111111,
+    0b1111111111,
+  ]
+};
+
+// Вариации стены 1111 для разнообразия
+export const tile_wall_1111_var1: SpriteDef = {
+  w: 10, h: 10, scale: 2, outline: false,
+  pixels: [
+    0b1111111111,
+    0b1000100011,
+    0b1111011111,
+    0b0011000110,
+    0b1111111111,
+    0b1000100011,
+    0b1111111101,
+    0b0011000110,
+    0b1111111111,
+    0b1111111111,
+  ]
+};
+
+export const tile_wall_1111_var2: SpriteDef = {
+  w: 10, h: 10, scale: 2, outline: false,
+  pixels: [
+    0b1111111111,
+    0b1000100011,
+    0b1111111111,
+    0b0011000110,
+    0b1110111111,
+    0b1000100011,
+    0b1111111111,
+    0b0011000110,
+    0b1111111111,
+    0b1111111111,
+  ]
+};
+
+// Поврежденная стена (трещины)
+export const tile_wall_damaged: SpriteDef = {
+  w: 10, h: 10, scale: 2, outline: false,
+  pixels: [
+    0b1111111111,
+    0b1000100011,
+    0b1111111111,
+    0b0011000110,
+    0b1111111111,
+    0b1000100011,
+    0b1111111111,
+    0b0010000110,
     0b1111111111,
     0b1111111111,
   ]
@@ -534,7 +633,52 @@ export const object_chest_open: SpriteDef = {
   ]
 };
 
-// Бочка (вода) - УЛУЧШЕННАЯ ДЕТАЛИЗАЦИЯ
+export const obj_chest: SpriteDef = object_chest_closed;
+
+export const obj_altar: SpriteDef = {
+  w: 10, h: 10, scale: 2, outline: true,
+  pixels: [
+    0b0011111000,
+    0b0111111100,
+    0b1110011110,
+    0b1110011110,
+    0b1111111110,
+    0b1111111110,
+    0b1110011110,
+    0b1110011110,
+    0b0111111100,
+    0b0011111000,
+  ]
+};
+
+export const entity_npc: SpriteDef = {
+  w: 8, h: 10, scale: 2, outline: true,
+  pixels: [
+    0b00111100,
+    0b01111110,
+    0b11111111,
+    0b11011011,
+    0b11111111,
+    0b00111100,
+    0b01111110,
+    0b01111110,
+    0b00100100,
+    0b00100100,
+  ]
+};
+
+export const entity_npc_hand: SpriteDef = {
+  w: 6, h: 4, scale: 2, outline: false,
+  pixels: [
+    0b011110,
+    0b111111,
+    0b011110,
+    0b001000,
+  ]
+};
+
+export const entity_npc_elder: SpriteDef = entity_npc;
+
 export const object_barrel_water: SpriteDef = {
   w: 8, h: 10, scale: 2, outline: true,
   pixels: [
@@ -584,6 +728,8 @@ export const object_barrel_explosive: SpriteDef = {
     0b01111110,
   ]
 };
+
+export const obj_barrel: SpriteDef = object_barrel_water;
 
 // Дверь закрытая
 export const object_door_closed: SpriteDef = {
@@ -637,6 +783,8 @@ export const trap_pit: SpriteDef = {
     0b0011111100,
   ]
 };
+
+export const tile_pit: SpriteDef = trap_pit;
 
 // Шипы — спокойно
 export const trap_spike_idle: SpriteDef = {
@@ -1109,6 +1257,60 @@ export const decor_crack_2: SpriteDef = {
   ]
 };
 
+// Мох на стенах/полу
+export const decor_moss_1: SpriteDef = {
+  w: 8, h: 8, scale: 2, outline: false,
+  pixels: [
+    0b00110000,
+    0b01111000,
+    0b00111100,
+    0b00011110,
+    0b00001111,
+    0b00000111,
+    0b00000011,
+    0b00000001,
+  ]
+};
+
+export const decor_moss_2: SpriteDef = {
+  w: 8, h: 8, scale: 2, outline: false,
+  pixels: [
+    0b00001100,
+    0b00011110,
+    0b00111100,
+    0b01111000,
+    0b11110000,
+    0b11100000,
+    0b11000000,
+    0b10000000,
+  ]
+};
+
+// Брызги крови (маленькие)
+export const decor_blood_splatter_1: SpriteDef = {
+  w: 6, h: 6, scale: 2, outline: false,
+  pixels: [
+    0b010000,
+    0b111000,
+    0b010100,
+    0b001010,
+    0b000100,
+    0b000000,
+  ]
+};
+
+export const decor_blood_splatter_2: SpriteDef = {
+  w: 6, h: 6, scale: 2, outline: false,
+  pixels: [
+    0b000010,
+    0b000111,
+    0b001010,
+    0b010100,
+    0b000111,
+    0b000000,
+  ]
+};
+
 // Факел на стене (источник света)
 export const object_torch: SpriteDef = {
   w: 6, h: 8, scale: 2, outline: true,
@@ -1248,3 +1450,8 @@ export const trap_plate_down: SpriteDef = {
     0b1111111111,
   ]
 };
+
+export const obj_spikes_0: SpriteDef = trap_spike_idle;
+export const obj_spikes_1: SpriteDef = trap_spike_rising;
+export const obj_plate_0: SpriteDef = trap_plate_up;
+export const obj_plate_1: SpriteDef = trap_plate_down;

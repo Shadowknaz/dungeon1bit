@@ -40,6 +40,13 @@ export interface Barrel {
     type: ElementType | 'explosive';
 }
 
+export interface Torch extends Point {
+    id: string;
+    gx: number;
+    gy: number;
+    lit?: boolean;
+}
+
 export interface Enemy {
     id: number;
     x: number;
@@ -57,7 +64,7 @@ export interface Enemy {
     health: number;
     maxHealth: number;
     fsm: any; // XState interpreter
-    memory: Point | null;
+    lastKnownPosition: Point | null;
     barkText: string;
     barkTimer: number;
     alertTimer: number;
@@ -65,6 +72,13 @@ export interface Enemy {
     statusTimer: number;
     angle?: number;
     anim?: AnimatedSprite;
+    memoryTimer: number;
+    shootTimer: number;
+    onShoot: (x: number, y: number, angle: number) => void;
+    detectionRange: number;
+    lastCanSeePlayer?: boolean;
+    noiseLevel: number; // 0-100 accumulation
+    noisePosition: Point | null; // Source of noise
 }
 
 export interface NPC extends Point {
@@ -82,7 +96,7 @@ export interface PressurePlate extends Point {
 
 export interface Chest extends Point {
     id: number;
-    opened: boolean;
+    opened?: boolean;
     items: ItemInstance[];
 }
 
@@ -99,4 +113,17 @@ export interface TrapPlate extends Point {
     id: string;
     state: number; // 0: idle, 1: pressed, 2: active
     timer: number;
+}
+
+export interface Projectile {
+    id: number;
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    damage: number;
+    type: 'player' | 'enemy';
+    lifetime: number;
+    radius: number;
+    isEnemy: boolean;
 }

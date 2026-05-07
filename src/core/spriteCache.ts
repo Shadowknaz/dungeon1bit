@@ -2,6 +2,12 @@ import * as defs from '../data/spriteDefs';
 
 export class SpriteCache {
   private cache = new Map<string, ImageBitmap>();
+  private rng: () => number;
+
+  constructor(customRng?: () => number) {
+    // Use custom RNG if provided (for reproducible results), otherwise Math.random
+    this.rng = customRng || Math.random;
+  }
 
   public async generateAll(): Promise<void> {
     const tasks = Object.entries(defs).map(async ([key, def]) => {
@@ -11,6 +17,36 @@ export class SpriteCache {
     });
     
     await Promise.all(tasks);
+  }
+
+  /**
+   * Создает вариацию спрайта с небольшими случайными изменениями
+   * @param baseKey базовый ключ спрайта
+   * @param variationSeed сид для вариации (0-1)
+   * @returns ключ вариации или базовый ключ если вариация не создана
+   */
+  public createVariation(baseKey: string, variationSeed: number): string {
+    // Для производительности используем предопределенные вариации вместо процедурной генерации
+    const variations = ['_var1', '_var2', '_var3'];
+    const variationIndex = Math.floor(variationSeed * variations.length);
+    const variationKey = `${baseKey}${variations[variationIndex]}`;
+    
+    // Если вариация существует в кэше, возвращаем её
+    if (this.cache.has(variationKey)) {
+      return variationKey;
+    }
+    
+    // Иначе возвращаем базовый спрайт
+    return baseKey;
+  }
+
+  /**
+   * Получить случайную вариацию спрайта
+   * @param baseKey базовый ключ спрайта
+   * @returns ключ спрайта (вариация или базовый)
+   */
+  public getRandomVariation(baseKey: string): string {
+    return this.createVariation(baseKey, this.rng());
   }
 
   private async renderDef(key: string, def: defs.SpriteDef): Promise<void> {

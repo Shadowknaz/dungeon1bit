@@ -1,22 +1,7 @@
 import { GAME_WIDTH, GAME_HEIGHT } from '../core/constants';
+import { NodeType, GlobalMapNode, GlobalMap } from '../data/typeNode';
 
-export type NodeStatus = 'locked' | 'available' | 'completed';
-export type NodeType = 'simple' | 'merchant' | 'shrine';
-
-export interface GlobalMapNode {
-    id: number;
-    layer: number;
-    x: number;
-    y: number;
-    type: NodeType;
-    next: number[];
-    status: NodeStatus;
-}
-
-export interface GlobalMap {
-    nodes: Record<number, GlobalMapNode>;
-    layers: GlobalMapNode[][];
-}
+export type { NodeType, GlobalMapNode, GlobalMap };
 
 export function generateGlobalMap(rng: { getUniform: () => number }): GlobalMap {
     const layersCount = 6;
@@ -68,9 +53,15 @@ export function generateGlobalMap(rng: { getUniform: () => number }): GlobalMap 
     // Assign special types
     const l2 = globalMap.layers[2];
     if (l2 && l2.length > 0) l2[Math.floor(rng.getUniform() * l2.length)].type = 'merchant';
-    
+
     const l4 = globalMap.layers[4];
     if (l4 && l4.length > 0) l4[Math.floor(rng.getUniform() * l4.length)].type = 'shrine';
+
+    // Boss on the last layer (layer 5, before final exit)
+    const l5 = globalMap.layers[5];
+    if (l5 && l5.length > 0) {
+        l5[Math.floor(rng.getUniform() * l5.length)].type = 'boss';
+    }
 
     return globalMap;
 }

@@ -33,6 +33,9 @@ export interface LightingFrameInput {
   frameCount: number;
   playerPos: Point;
   playerVisionRadius: number;
+  playerAngle?: number;  // Angle in radians for cone vision
+  playerFovAngle?: number; // Half-angle of cone (default: PI for full circle)
+  absoluteVisibilityRadius?: number; // Small circle around player with absolute visibility (default: 2)
   isBlocking: (x: number, y: number) => boolean;
 }
 
@@ -57,6 +60,7 @@ class LumenSystem {
   private lightSources: Map<string, LightSource> = new Map();
   private lightMap: LightMap | null = null;
   private visibilityCache: VisibilityCache | null = null;
+  private aoMap: Float32Array | null = null; // Ambient occlusion map
 
   // Множество дизеринг паттернов для разных уровней света
   private ditherPatterns = {
@@ -95,6 +99,7 @@ class LumenSystem {
     this.width = width;
     this.height = height;
     this.lightMap = new Float32Array(width * height);
+    this.aoMap = new Float32Array(width * height);
     this.visibilityCache = {
       map: new Uint8Array(width * height),
       lastUpdateFrame: 0
@@ -107,6 +112,7 @@ class LumenSystem {
     this.lastLightSourcesHash = '';
     this.lastPlayerPos = null;
     if (this.lightMap) this.lightMap.fill(0);
+    if (this.aoMap) this.aoMap.fill(0);
     if (this.visibilityCache) {
       this.visibilityCache.map.fill(0);
       this.visibilityCache.lastUpdateFrame = 0;
@@ -145,6 +151,21 @@ class LumenSystem {
     return Array.from(this.lightSources.keys());
   }
 
+  toggleLight(id: string): boolean {
+    const source = this.lightSources.get(id);
+    if (source) {
+      source.active = !source.active;
+      this.markDirty(source.x, source.y, source.radius);
+      return source.active;
+    }
+    return false;
+  }
+
+  isLightActive(id: string): boolean {
+    const source = this.lightSources.get(id);
+    return source ? source.active : false;
+  }
+
   private inBounds(x: number, y: number): boolean {
     return x >= 0 && x < this.width && y >= 0 && y < this.height;
   }
@@ -169,12 +190,12 @@ class LumenSystem {
   calculateLighting(input: LightingFrameInput) {
     if (!this.lightMap || !this.visibilityCache) return;
 
-    const { frameCount, playerPos, playerVisionRadius, isBlocking } = input;
+    const { frameCount, playerPos, playerVisionRadius, playerAngle = 0, playerFovAngle = Math.PI, absoluteVisibilityRadius = 2, isBlocking } = input;
 
     // Проверка dirty flags - пересчитать если изменилось
     const newHash = this.getLightSourcesHash();
-    const playerPosChanged = !this.lastPlayerPos || 
-      this.lastPlayerPos.x !== playerPos.x || 
+    const playerPosChanged = !this.lastPlayerPos ||
+      this.lastPlayerPos.x !== playerPos.x ||
       this.lastPlayerPos.y !== playerPos.y;
     const visionRadiusChanged = this.lastPlayerVisionRadius !== playerVisionRadius;
     const lightsChanged = newHash !== this.lastLightSourcesHash;
@@ -184,7 +205,7 @@ class LumenSystem {
       map.fill(0);
       this.lightMap.fill(0);
 
-      this.computeVisibility(playerPos.x, playerPos.y, playerVisionRadius, map, isBlocking);
+      this.computeVisibility(playerPos.x, playerPos.y, playerVisionRadius, playerAngle, playerFovAngle, absoluteVisibilityRadius, map, isBlocking);
       this.addLightContribution(playerPos.x, playerPos.y, playerVisionRadius, 1.0, isBlocking);
 
       this.lightSources.forEach(source => {
@@ -192,6 +213,9 @@ class LumenSystem {
           this.addLightContribution(source.x, source.y, source.radius, source.intensity, isBlocking);
         }
       });
+
+      // Вычисляем ambient occlusion
+      this.computeAmbientOcclusion(isBlocking);
 
       this.dirtyRegions.clear();
     }
@@ -202,13 +226,109 @@ class LumenSystem {
     this.visibilityCache.lastUpdateFrame = frameCount;
   }
 
-  private computeVisibility(cx: number, cy: number, radius: number, visibleMap: Uint8Array, isBlocking: (x: number, y: number) => boolean) {
+  /**
+   * Вычисляет ambient occlusion для углов и внутренних углов
+   * AO делает углы темнее, создавая эффект глубины
+   */
+  private computeAmbientOcclusion(isBlocking: (x: number, y: number) => boolean): void {
+    if (!this.aoMap) return;
+
+    // Сбрасываем AO map
+    this.aoMap.fill(0);
+
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        // Пропускаем стены - AO только для пола
+        if (isBlocking(x, y)) continue;
+
+        let aoFactor = 0;
+
+        // Проверяем 8 соседей
+        const neighbors = [
+          { dx: -1, dy: -1, weight: 0.5 },  // верх-лево (угол)
+          { dx: 0, dy: -1, weight: 0.3 },   // верх
+          { dx: 1, dy: -1, weight: 0.5 },   // верх-право (угол)
+          { dx: -1, dy: 0, weight: 0.3 },   // лево
+          { dx: 1, dy: 0, weight: 0.3 },    // право
+          { dx: -1, dy: 1, weight: 0.5 },   // низ-лево (угол)
+          { dx: 0, dy: 1, weight: 0.3 },    // низ
+          { dx: 1, dy: 1, weight: 0.5 },    // низ-право (угол)
+        ];
+
+        for (const neighbor of neighbors) {
+          const nx = x + neighbor.dx;
+          const ny = y + neighbor.dy;
+
+          if (this.inBounds(nx, ny) && isBlocking(nx, ny)) {
+            aoFactor += neighbor.weight;
+          }
+        }
+
+        // Нормализуем AO (максимум ~2.0, ограничиваем до 0.5)
+        aoFactor = Math.min(aoFactor, 0.5);
+
+        const idx = y * this.width + x;
+        this.aoMap[idx] = aoFactor;
+      }
+    }
+  }
+
+  /**
+   * Получить значение ambient occlusion для клетки
+   * @returns значение от 0 (нет AO) до 0.5 (максимальное затемнение)
+   */
+  getAO(x: number, y: number): number {
+    if (!this.aoMap || !this.inBounds(x, y)) return 0;
+    return this.aoMap[y * this.width + x];
+  }
+
+  private computeVisibility(cx: number, cy: number, radius: number, playerAngle: number, fovHalfAngle: number, absoluteRadius: number, visibleMap: Uint8Array, isBlocking: (x: number, y: number) => boolean) {
     if (!this.inBounds(cx, cy)) return;
+
+    // Full circle if fovHalfAngle >= PI
+    const fullCircle = fovHalfAngle >= Math.PI - 0.01;
     const steps = Math.max(64, radius * 16);
+
+    // First, mark absolute radius circle with full 360-degree raycasting
+    const absoluteSteps = Math.max(32, absoluteRadius * 16);
+    for (let i = 0; i < absoluteSteps; i++) {
+      const rayAngle = (Math.PI * 2 * i) / absoluteSteps;
+      const dx = Math.cos(rayAngle);
+      const dy = Math.sin(rayAngle);
+
+      let x = cx + 0.5;
+      let y = cy + 0.5;
+
+      for (let r = 0; r < absoluteRadius; r += 0.5) {
+        const tx = Math.floor(x);
+        const ty = Math.floor(y);
+
+        if (!this.inBounds(tx, ty)) break;
+
+        const idx = ty * this.width + tx;
+        visibleMap[idx] = 1;
+
+        if (isBlocking(tx, ty)) {
+          break;
+        }
+
+        x += dx;
+        y += dy;
+      }
+    }
+
+    // Then, mark the main vision cone with larger radius
     for (let i = 0; i < steps; i++) {
-      const angle = (Math.PI * 2 * i) / steps;
-      const dx = Math.cos(angle);
-      const dy = Math.sin(angle);
+      const rayAngle = (Math.PI * 2 * i) / steps;
+      // Skip rays outside cone
+      if (!fullCircle) {
+        let angleDiff = Math.abs(rayAngle - playerAngle);
+        if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+        if (angleDiff > fovHalfAngle) continue;
+      }
+
+      const dx = Math.cos(rayAngle);
+      const dy = Math.sin(rayAngle);
 
       let x = cx + 0.5;
       let y = cy + 0.5;
@@ -231,6 +351,7 @@ class LumenSystem {
       }
     }
 
+    // Ensure center is always visible
     const centerIdx = cy * this.width + cx;
     visibleMap[centerIdx] = 1;
   }
@@ -256,6 +377,9 @@ class LumenSystem {
     const minY = Math.max(0, ly - radius);
     const maxY = Math.min(this.height - 1, ly + radius);
 
+    // Gradual fade zone - last 20% of radius
+    const fadeStart = radius * 0.8;
+
     for (let y = minY; y <= maxY; y++) {
       for (let x = minX; x <= maxX; x++) {
         const dx = x - lx;
@@ -265,7 +389,14 @@ class LumenSystem {
         if (!this.hasLineOfSight(lx, ly, x, y, isBlocking)) continue;
 
         const dist = Math.sqrt(distSq);
-        const falloff = Math.pow(Math.max(0, 1 - dist / radius), 2);
+        let falloff = Math.pow(Math.max(0, 1 - dist / radius), 2);
+
+        // Apply gradual fade at edges
+        if (dist > fadeStart) {
+          const fadeProgress = (dist - fadeStart) / (radius - fadeStart);
+          falloff *= (1 - fadeProgress * 0.5); // Reduce intensity by up to 50% at edge
+        }
+
         const idx = y * this.width + x;
         this.lightMap[idx] = Math.max(this.lightMap[idx], falloff * intensity);
       }

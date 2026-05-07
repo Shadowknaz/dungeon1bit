@@ -72,3 +72,33 @@ export function resolveCollision(circle: Circle, rect: Rect): void {
         }
     }
 }
+
+/**
+ * Applies separation force between enemies to prevent crowding.
+ * Enemies push each other away if they are too close.
+ */
+export function applyEnemySeparation(enemies: Circle[], minDistance: number = 25): void {
+    for (let i = 0; i < enemies.length; i++) {
+        for (let j = i + 1; j < enemies.length; j++) {
+            const a = enemies[i];
+            const b = enemies[j];
+            
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            const distSq = dx * dx + dy * dy;
+            const minDist = minDistance + a.radius + b.radius;
+            
+            if (distSq < minDist * minDist && distSq > 0) {
+                const dist = Math.sqrt(distSq);
+                const overlap = minDist - dist;
+                const pushX = (dx / dist) * overlap * 0.5;
+                const pushY = (dy / dist) * overlap * 0.5;
+                
+                a.x += pushX;
+                a.y += pushY;
+                b.x -= pushX;
+                b.y -= pushY;
+            }
+        }
+    }
+}

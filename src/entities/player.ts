@@ -1,5 +1,7 @@
 import { GAME_WIDTH } from '../core/constants';
 import { AnimatedSprite } from '../core/animatedSprite';
+import { addComponent, IWorld } from 'bitecs';
+import { Position, Health, PlayerTag } from '../components';
 
 export interface PlayerStats {
     speed: number;
@@ -41,14 +43,24 @@ export interface PlayerState {
     statusTimer: number;
     hasThermal?: boolean;
     hasChalice?: boolean;
+    godMode?: boolean;
     anim?: AnimatedSprite;
 }
 
-export function createPlayer(eid: number): PlayerState {
+export function createPlayer(world: IWorld, eid: number): PlayerState {
+    addComponent(world, PlayerTag, eid);
+    addComponent(world, Position, eid);
+    addComponent(world, Health, eid);
+
+    Position.x[eid] = GAME_WIDTH / 2;
+    Position.y[eid] = 520;
+    Health.current[eid] = 100;
+    Health.max[eid] = 100;
+
     const baseStats: PlayerStats = {
         speed: 1,
         dashCooldown: 120,
-        dashSpeed: 8,
+        dashSpeed: 4,
         dashDuration: 8
     };
 

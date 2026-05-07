@@ -1,4 +1,4 @@
-export type ObjectType = 'barrel' | 'chest' | 'trap_spike' | 'trap_plate' | 'npc_civilian' | 'torch';
+export type ObjectType = 'barrel' | 'chest' | 'trap_spike' | 'trap_plate' | 'trap_pit' | 'npc_civilian' | 'torch';
 
 export interface ObjectProperties {
     type: ObjectType;
@@ -17,8 +17,8 @@ export const OBJECTS_DB: Record<ObjectType, ObjectProperties> = {
     'chest': {
         type: 'chest',
         name: 'Сундук',
-        spawnChance: 0.15, // Reduced chance
-        maxPerRoom: 1     // Max 1 per map
+        spawnChance: 0.4,  // 40% chance per eligible room
+        maxPerRoom: 1      // Max 1 per room, 1 per dungeon total
     },
     'trap_spike': {
         type: 'trap_spike',
@@ -32,16 +32,22 @@ export const OBJECTS_DB: Record<ObjectType, ObjectProperties> = {
         spawnChance: 1.0, // Always spawned with secret rooms
         maxPerRoom: 1
     },
+    'trap_pit': {
+        type: 'trap_pit',
+        name: 'Яма',
+        spawnChance: 0.3,
+        maxPerRoom: 2
+    },
     'npc_civilian': {
         type: 'npc_civilian',
         name: 'Мирный житель',
-        spawnChance: 0.3,
-        maxPerRoom: 2
+        spawnChance: 0.25,  // 25% chance per eligible room
+        maxPerRoom: 1       // Max 1 per room
     },
     'torch': {
         type: 'torch',
         name: 'Факел',
-        spawnChance: 0.8,
+        spawnChance: 0.0,
         maxPerRoom: 4
     }
 };

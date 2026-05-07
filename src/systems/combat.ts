@@ -1,10 +1,14 @@
 import { Point } from './physics';
 
 export interface Projectile extends Point {
+    id: number;
     vx: number;
     vy: number;
     isEnemy: boolean;
     radius: number;
+    damage: number;
+    type: 'player' | 'enemy';
+    lifetime: number;
 }
 
 /**
@@ -104,12 +108,16 @@ export class CombatSystem {
             const jitter = (Math.random() - 0.5) * spread * 0.5;
             const finalAngle = angle + startOffset + (i * spread) + jitter;
             projectiles.push({
+                id: Math.random(),
                 x: origin.x + Math.cos(finalAngle) * radius,
                 y: origin.y + Math.sin(finalAngle) * radius,
                 vx: Math.cos(finalAngle) * (isEnemy ? 1 : 5),
                 vy: Math.sin(finalAngle) * (isEnemy ? 1 : 5),
                 isEnemy,
-                radius: isEnemy ? 4 : 3
+                radius: isEnemy ? 4 : 3,
+                damage: 1,
+                type: isEnemy ? 'enemy' : 'player',
+                lifetime: 180
             });
         }
 
