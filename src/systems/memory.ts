@@ -1,4 +1,4 @@
-import { Point, Enemy } from '../types';
+import { Point, Enemy } from '../domain/types';
 
 /**
  * Memory system for enemy AI

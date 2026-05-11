@@ -1,4 +1,9 @@
-import { Point } from '../types';
+import { Point } from '../domain/types';
+import { 
+    MAP_COLS, MAP_ROWS, 
+    LIGHTING_FULL_INTERVAL, PLAYER_VISION_RADIUS, 
+    VISIBILITY_ABSOLUTE_RADIUS, PLAYER_FOV_ANGLE 
+} from '../core/constants';
 
 // Типы источников света
 export enum LightType {
@@ -36,7 +41,9 @@ export interface LightingFrameInput {
   playerAngle?: number;  // Angle in radians for cone vision
   playerFovAngle?: number; // Half-angle of cone (default: PI for full circle)
   absoluteVisibilityRadius?: number; // Small circle around player with absolute visibility (default: 2)
-  isBlocking: (x: number, y: number) => boolean;
+  passabilityRaw: Uint8Array;
+  mapCols: number;
+  bounds?: { startX: number, endX: number, startY: number, endY: number };
 }
 
 // Интерфейс для информации об освещенности для игровых систем
@@ -61,6 +68,7 @@ class LumenSystem {
   private lightMap: LightMap | null = null;
   private visibilityCache: VisibilityCache | null = null;
   private aoMap: Float32Array | null = null; // Ambient occlusion map
+  private dirtyAO: boolean = true;
 
   // Множество дизеринг паттернов для разных уровней света
   private ditherPatterns = {
@@ -89,9 +97,8 @@ class LumenSystem {
 
   // Dirty flags - отслеживание измененных областей
   private dirtyRegions: Set<string> = new Set();
-  private lastLightSourcesHash: string = '';
-  private lastPlayerPos: Point | null = null;
   private lastPlayerVisionRadius: number = 0;
+  private static readonly CALC_MARGIN = 5;
 
   constructor() {}
 
@@ -147,6 +154,10 @@ class LumenSystem {
     this.lightSources.delete(id);
   }
 
+  triggerDirtyAO() {
+    this.dirtyAO = true;
+  }
+
   getAllLightIds(): string[] {
     return Array.from(this.lightSources.keys());
   }
@@ -190,32 +201,51 @@ class LumenSystem {
   calculateLighting(input: LightingFrameInput) {
     if (!this.lightMap || !this.visibilityCache) return;
 
-    const { frameCount, playerPos, playerVisionRadius, playerAngle = 0, playerFovAngle = Math.PI, absoluteVisibilityRadius = 2, isBlocking } = input;
+    const { frameCount, playerPos, playerVisionRadius, playerAngle = 0, playerFovAngle = PLAYER_FOV_ANGLE, absoluteVisibilityRadius = VISIBILITY_ABSOLUTE_RADIUS, passabilityRaw, mapCols } = input;
 
-    // Проверка dirty flags - пересчитать если изменилось
+    // 1. Throttling: Recalculate at most every N frames unless lights changed significantly
+    if (frameCount % LIGHTING_FULL_INTERVAL !== 0 && this.lastLightSourcesHash === this.getLightSourcesHash()) {
+        return;
+    }
+
     const newHash = this.getLightSourcesHash();
-    const playerPosChanged = !this.lastPlayerPos ||
-      this.lastPlayerPos.x !== playerPos.x ||
-      this.lastPlayerPos.y !== playerPos.y;
+    const distMoved = this.lastPlayerPos ? Math.abs(this.lastPlayerPos.x - playerPos.x) + Math.abs(this.lastPlayerPos.y - playerPos.y) : 999;
+    
+    // 2. Movement threshold: Only update if player moved more than a small amount or lights changed
+    const playerPosChanged = distMoved > 0.15;
     const visionRadiusChanged = this.lastPlayerVisionRadius !== playerVisionRadius;
     const lightsChanged = newHash !== this.lastLightSourcesHash;
 
     if (playerPosChanged || visionRadiusChanged || lightsChanged || this.dirtyRegions.size > 0) {
       const { map } = this.visibilityCache;
+      const bounds = input.bounds || { startX: 0, endX: this.width, startY: 0, endY: this.height };
+      
+      const calcStartX = Math.max(0, bounds.startX - LumenSystem.CALC_MARGIN);
+      const calcEndX = Math.min(this.width, bounds.endX + LumenSystem.CALC_MARGIN);
+      const calcStartY = Math.max(0, bounds.startY - LumenSystem.CALC_MARGIN);
+      const calcEndY = Math.min(this.height, bounds.endY + LumenSystem.CALC_MARGIN);
+
       map.fill(0);
       this.lightMap.fill(0);
 
-      this.computeVisibility(playerPos.x, playerPos.y, playerVisionRadius, playerAngle, playerFovAngle, absoluteVisibilityRadius, map, isBlocking);
-      this.addLightContribution(playerPos.x, playerPos.y, playerVisionRadius, 1.0, isBlocking);
+      this.computeVisibility(playerPos.x, playerPos.y, playerVisionRadius, playerAngle, playerFovAngle, absoluteVisibilityRadius, map, passabilityRaw, mapCols);
+      this.addLightContribution(playerPos.x, playerPos.y, playerVisionRadius, 1.0, passabilityRaw, mapCols);
 
       this.lightSources.forEach(source => {
         if (source.active) {
-          this.addLightContribution(source.x, source.y, source.radius, source.intensity, isBlocking);
+          // Cull lights outside calculation bounds
+          if (source.x >= calcStartX - source.radius && source.x <= calcEndX + source.radius &&
+              source.y >= calcStartY - source.radius && source.y <= calcEndY + source.radius) {
+            this.addLightContribution(source.x, source.y, source.radius, source.intensity, passabilityRaw, mapCols);
+          }
         }
       });
 
-      // Вычисляем ambient occlusion
-      this.computeAmbientOcclusion(isBlocking);
+      // Вычисляем AO только в видимой области и только если нужно
+      if (this.dirtyAO) {
+        this.computeAmbientOcclusion(passabilityRaw, mapCols);
+        this.dirtyAO = false;
+      }
 
       this.dirtyRegions.clear();
     }
@@ -230,7 +260,7 @@ class LumenSystem {
    * Вычисляет ambient occlusion для углов и внутренних углов
    * AO делает углы темнее, создавая эффект глубины
    */
-  private computeAmbientOcclusion(isBlocking: (x: number, y: number) => boolean): void {
+  private computeAmbientOcclusion(passabilityRaw: Uint8Array, mapCols: number): void {
     if (!this.aoMap) return;
 
     // Сбрасываем AO map
@@ -239,7 +269,7 @@ class LumenSystem {
     for (let y = 0; y < this.height; y++) {
       for (let x = 0; x < this.width; x++) {
         // Пропускаем стены - AO только для пола
-        if (isBlocking(x, y)) continue;
+        if (passabilityRaw[y * mapCols + x] === 0) continue;
 
         let aoFactor = 0;
 
@@ -259,7 +289,7 @@ class LumenSystem {
           const nx = x + neighbor.dx;
           const ny = y + neighbor.dy;
 
-          if (this.inBounds(nx, ny) && isBlocking(nx, ny)) {
+          if (this.inBounds(nx, ny) && passabilityRaw[ny * mapCols + nx] === 0) {
             aoFactor += neighbor.weight;
           }
         }
@@ -282,12 +312,13 @@ class LumenSystem {
     return this.aoMap[y * this.width + x];
   }
 
-  private computeVisibility(cx: number, cy: number, radius: number, playerAngle: number, fovHalfAngle: number, absoluteRadius: number, visibleMap: Uint8Array, isBlocking: (x: number, y: number) => boolean) {
+  private computeVisibility(cx: number, cy: number, radius: number, playerAngle: number, fovHalfAngle: number, absoluteRadius: number, visibleMap: Uint8Array, passabilityRaw: Uint8Array, mapCols: number) {
     if (!this.inBounds(cx, cy)) return;
 
     // Full circle if fovHalfAngle >= PI
     const fullCircle = fovHalfAngle >= Math.PI - 0.01;
-    const steps = Math.max(64, radius * 16);
+    // Optimized ray count: 48 minimum, radius * 8 instead of 16
+    const steps = Math.max(48, radius * 8);
 
     // First, mark absolute radius circle with full 360-degree raycasting
     const absoluteSteps = Math.max(32, absoluteRadius * 16);
@@ -308,7 +339,7 @@ class LumenSystem {
         const idx = ty * this.width + tx;
         visibleMap[idx] = 1;
 
-        if (isBlocking(tx, ty)) {
+        if (passabilityRaw[idx] === 0) {
           break;
         }
 
@@ -342,7 +373,7 @@ class LumenSystem {
         const idx = ty * this.width + tx;
         visibleMap[idx] = 1;
 
-        if (isBlocking(tx, ty)) {
+        if (passabilityRaw[idx] === 0) {
           break;
         }
 
@@ -356,20 +387,20 @@ class LumenSystem {
     visibleMap[centerIdx] = 1;
   }
 
-  private hasLineOfSight(x0: number, y0: number, x1: number, y1: number, isBlocking: (x: number, y: number) => boolean): boolean {
+  private hasLineOfSight(x0: number, y0: number, x1: number, y1: number, passabilityRaw: Uint8Array, mapCols: number): boolean {
     const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0));
     for (let i = 1; i <= steps; i++) {
       const t = i / steps;
       const x = Math.floor(x0 + (x1 - x0) * t);
       const y = Math.floor(y0 + (y1 - y0) * t);
-      if ((x !== x0 || y !== y0) && isBlocking(x, y)) {
+      if ((x !== x0 || y !== y0) && passabilityRaw[y * mapCols + x] === 0) {
         return x === x1 && y === y1;
       }
     }
     return true;
   }
 
-  private addLightContribution(lx: number, ly: number, radius: number, intensity: number, isBlocking: (x: number, y: number) => boolean) {
+  private addLightContribution(lx: number, ly: number, radius: number, intensity: number, passabilityRaw: Uint8Array, mapCols: number) {
     if (!this.lightMap) return;
     const rSquared = radius * radius;
     const minX = Math.max(0, lx - radius);
@@ -386,7 +417,7 @@ class LumenSystem {
         const dy = y - ly;
         const distSq = dx * dx + dy * dy;
         if (distSq > rSquared) continue;
-        if (!this.hasLineOfSight(lx, ly, x, y, isBlocking)) continue;
+        if (!this.hasLineOfSight(lx, ly, x, y, passabilityRaw, mapCols)) continue;
 
         const dist = Math.sqrt(distSq);
         let falloff = Math.pow(Math.max(0, 1 - dist / radius), 2);

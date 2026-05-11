@@ -1,4 +1,4 @@
-import { MAP_COLS, MAP_ROWS, TILE_SIZE } from '../core/constants';
+import { MAP_COLS, MAP_ROWS, TILE_SIZE, GAME_WIDTH, WORLD_WIDTH, WORLD_HEIGHT } from '../core/constants';
 
 export type NodeStatus = 'locked' | 'available' | 'completed';
 export type NodeType = 'simple' | 'merchant' | 'shrine' | 'boss';
@@ -9,6 +9,7 @@ export interface GlobalMapNode {
     x: number;
     y: number;
     type: NodeType;
+    biomeId: string;
     next: number[];
     status: NodeStatus;
 }
@@ -65,10 +66,12 @@ export function generateEmptyGrid(): number[][] {
 
 export function generateSimpleRoom(): RoomGeneratorResult {
     // Возвращаем пустой результат - генерация происходит через DungeonSystem
+    const lobbyX = Math.floor(MAP_COLS / 2);
+    const lobbyY = MAP_ROWS - 11;
     return {
         grid: generateEmptyGrid(),
         exitRoomCenter: { x: 0, y: 0 },
-        startDoor: { x: 340, y: 440, w: 120, h: 20, type: 'start', open: false },
+        startDoor: { x: WORLD_WIDTH / 2 - 60, y: (lobbyY + 3) * TILE_SIZE, w: 120, h: 20, type: 'start', open: false },
         floorTiles: []
     };
 }
@@ -86,23 +89,26 @@ export function generateMerchantRoom(): RoomGeneratorResult {
     }
 
     // Коридор вниз к стартовой зоне
-    for (let y = cy + 5; y < 22; y++) {
+    const lobbyY = MAP_ROWS - 11;
+    const lobbyX = Math.floor(MAP_COLS / 2);
+
+    for (let y = cy + 5; y < lobbyY + 3; y++) {
         grid[cx][y] = 0;
         grid[cx - 1][y] = 0;
         grid[cx + 1][y] = 0;
     }
 
-    // Проход к выходу
-    for (let x = 16; x <= 23; x++) {
-        for (let y = 19; y < 22; y++) {
+    // Проход к лобби
+    for (let x = lobbyX - 4; x <= lobbyX + 3; x++) {
+        for (let y = lobbyY; y < lobbyY + 3; y++) {
             grid[x][y] = 0;
         }
     }
 
-    // Стартовая зона
+    // Стартовая зона (лобби и коридор входа)
     for (let x = 0; x < MAP_COLS; x++) {
-        for (let y = 22; y < MAP_ROWS; y++) {
-            grid[x][y] = (x >= 17 && x <= 22) ? 0 : 1;
+        for (let y = lobbyY + 3; y < MAP_ROWS; y++) {
+            grid[x][y] = (x >= lobbyX - 3 && x <= lobbyX + 2) ? 0 : 1;
         }
     }
 
@@ -118,7 +124,7 @@ export function generateMerchantRoom(): RoomGeneratorResult {
     return {
         grid,
         exitRoomCenter: { x: cx * TILE_SIZE, y: (cy - 5) * TILE_SIZE },
-        startDoor: { x: 340, y: 440, w: 120, h: 20, type: 'start', open: false },
+        startDoor: { x: WORLD_WIDTH / 2 - 60, y: (lobbyY + 3) * TILE_SIZE, w: 120, h: 20, type: 'start', open: false },
         floorTiles
     };
 }
@@ -165,7 +171,10 @@ export function generateBossArena(): RoomGeneratorResult {
     }
 
     // Коридор вниз к стартовой зоне
-    for (let y = bottom + 1; y < 22; y++) {
+    const lobbyY = MAP_ROWS - 11;
+    const lobbyX = Math.floor(MAP_COLS / 2);
+
+    for (let y = bottom + 1; y < lobbyY + 3; y++) {
         for (let x = cx - 1; x <= cx + 1; x++) {
             grid[x][y] = 0;
         }
@@ -176,17 +185,17 @@ export function generateBossArena(): RoomGeneratorResult {
         grid[x][top - 1] = 0; // Убираем стену для выхода
     }
 
-    // Стартовая зона внизу
-    for (let x = 16; x <= 23; x++) {
-        for (let y = 19; y < 22; y++) {
+    // Стартовое лобби
+    for (let x = lobbyX - 4; x <= lobbyX + 3; x++) {
+        for (let y = lobbyY; y < lobbyY + 3; y++) {
             grid[x][y] = 0;
         }
     }
 
-    // Основная стартовая зона
+    // Основная стартовая зона (коридор входа)
     for (let x = 0; x < MAP_COLS; x++) {
-        for (let y = 22; y < MAP_ROWS; y++) {
-            grid[x][y] = (x >= 17 && x <= 22) ? 0 : 1;
+        for (let y = lobbyY + 3; y < MAP_ROWS; y++) {
+            grid[x][y] = (x >= lobbyX - 3 && x <= lobbyX + 2) ? 0 : 1;
         }
     }
 
@@ -203,7 +212,7 @@ export function generateBossArena(): RoomGeneratorResult {
     return {
         grid,
         exitRoomCenter: { x: cx * TILE_SIZE, y: top * TILE_SIZE },
-        startDoor: { x: 340, y: 440, w: 120, h: 20, type: 'start', open: false },
+        startDoor: { x: WORLD_WIDTH / 2 - 60, y: (lobbyY + 3) * TILE_SIZE, w: 120, h: 20, type: 'start', open: false },
         floorTiles
     };
 }

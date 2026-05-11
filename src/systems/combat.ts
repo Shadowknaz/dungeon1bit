@@ -1,15 +1,5 @@
-import { Point } from './physics';
-
-export interface Projectile extends Point {
-    id: number;
-    vx: number;
-    vy: number;
-    isEnemy: boolean;
-    radius: number;
-    damage: number;
-    type: 'player' | 'enemy';
-    lifetime: number;
-}
+import { Utils } from './physics';
+import { Point, Projectile } from '../domain/types';
 
 /**
  * Модификаторы боя на основе света
@@ -94,15 +84,18 @@ export class CombatSystem {
     spawnProjectiles(
         origin: Point,
         angle: number,
-        stats: { projectiles: number, spreadAngle: number },
+        stats: { projectiles: number, spreadAngle: number, projectileLifetime?: number },
         consecutiveShots: number,
         radius: number,
-        isEnemy: boolean = false
+        isEnemy: boolean = false,
+        projectileSpeed?: number
     ): Projectile[] {
         const projectiles: Projectile[] = [];
         const projs = stats.projectiles || 1;
         const spread = this.calculateSpread(stats.spreadAngle || 0, consecutiveShots);
         const startOffset = - (projs - 1) * spread / 2;
+        const speed = projectileSpeed || (isEnemy ? 2.2 : 3.5);
+        const lifetime = stats.projectileLifetime || 180;
 
         for (let i = 0; i < projs; i++) {
             const jitter = (Math.random() - 0.5) * spread * 0.5;
@@ -111,13 +104,13 @@ export class CombatSystem {
                 id: Math.random(),
                 x: origin.x + Math.cos(finalAngle) * radius,
                 y: origin.y + Math.sin(finalAngle) * radius,
-                vx: Math.cos(finalAngle) * (isEnemy ? 1 : 5),
-                vy: Math.sin(finalAngle) * (isEnemy ? 1 : 5),
+                vx: Math.cos(finalAngle) * speed,
+                vy: Math.sin(finalAngle) * speed,
                 isEnemy,
                 radius: isEnemy ? 4 : 3,
                 damage: 1,
                 type: isEnemy ? 'enemy' : 'player',
-                lifetime: 180
+                lifetime
             });
         }
 

@@ -9,7 +9,9 @@ export enum ParticleType {
     BLOOD = 4,        // Кровь (красные капли)
     FOOTSTEP = 5,     // След от шага (исчезает медленно)
     EMBER = 6,        // Угли (мерцающие)
-    STEAM = 7         // Пар (поднимается вверх)
+    STEAM = 7,        // Пар (поднимается вверх)
+    EXPLOSION = 8,    // Взрыв (быстрые оранжевые круги)
+    FLASH = 9         // Вспышка (быстрые белые круги)
 }
 
 export interface TrailPoint {
@@ -79,6 +81,20 @@ export class ParticleSystem {
                     this.vx[idx] = (Math.random() - 0.5) * 1;
                     this.vy[idx] = -1 - Math.random(); // Быстро поднимается
                     this.decay[idx] = 0.04 + Math.random() * 0.04;
+                    break;
+                case ParticleType.EXPLOSION:
+                    const angE = Math.random() * Math.PI * 2;
+                    const velE = (1 + Math.random() * 3) * 0.5; // Reduced for 2-3 tile spread and slowed down
+                    this.vx[idx] = Math.cos(angE) * velE;
+                    this.vy[idx] = Math.sin(angE) * velE;
+                    this.decay[idx] = (0.01 + Math.random() * 0.02) * 0.5; 
+                    break;
+                case ParticleType.FLASH:
+                    const angF = Math.random() * Math.PI * 2;
+                    const velF = (2 + Math.random() * 4) * 0.5; // Reduced and slowed
+                    this.vx[idx] = Math.cos(angF) * velF;
+                    this.vy[idx] = Math.sin(angF) * velF;
+                    this.decay[idx] = (0.02 + Math.random() * 0.05) * 0.5;
                     break;
                 default:
                     this.vx[idx] = (Math.random() - 0.5) * 6;
@@ -157,6 +173,21 @@ export class ParticleSystem {
      */
     spawnSteam(x: number, y: number, count: number = 5): void {
         this.spawn(x, y, count, ParticleType.STEAM, 4);
+    }
+
+    spawnExplosion(x: number, y: number): void {
+        this.spawn(x, y, 120, ParticleType.EXPLOSION, 3, '#ffffff');
+        this.spawn(x, y, 80, ParticleType.SMOKE, 5, '#888888');
+    }
+
+    spawnFlash(x: number, y: number): void {
+        this.spawn(x, y, 150, ParticleType.FLASH, 4, '#ffffff');
+        this.spawn(x, y, 60, ParticleType.STEAM, 8, '#cccccc');
+    }
+
+    spawnWallDebris(x: number, y: number): void {
+        this.spawn(x, y, 15, ParticleType.ASH, 3, '#888888');
+        this.spawn(x, y, 10, ParticleType.SMOKE, 4, '#666666');
     }
 
     private hexToUint32(hex: string): number {
@@ -274,6 +305,18 @@ export class ParticleSystem {
             } else if (type === ParticleType.STEAM) {
                 // Пар (полупрозрачные круги)
                 ctx.fillStyle = '#cccccc';
+                ctx.beginPath();
+                ctx.arc(this.x[i], this.y[i], size, 0, Math.PI * 2);
+                ctx.fill();
+            } else if (type === ParticleType.EXPLOSION) {
+                const r = Math.random();
+                ctx.fillStyle = r > 0.5 ? '#ffffff' : '#888888'; // White and Grey gradient
+                ctx.beginPath();
+                ctx.arc(this.x[i], this.y[i], size, 0, Math.PI * 2);
+                ctx.fill();
+            } else if (type === ParticleType.FLASH) {
+                const r = Math.random();
+                ctx.fillStyle = r > 0.7 ? '#ffffff' : '#bbbbbb';
                 ctx.beginPath();
                 ctx.arc(this.x[i], this.y[i], size, 0, Math.PI * 2);
                 ctx.fill();

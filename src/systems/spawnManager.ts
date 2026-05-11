@@ -8,6 +8,16 @@ export interface SpawnPosition {
     gy: number;
 }
 
+export enum RoomTheme {
+    DEFAULT = 'default',
+    ARMORY = 'armory',
+    MINEFIELD = 'minefield',
+    ARENA = 'arena',
+    WAREHOUSE = 'warehouse',
+    PRISON = 'prison',
+    TREASURY = 'treasury'
+}
+
 export interface RoomData {
     id: string;
     left: number;
@@ -17,41 +27,39 @@ export interface RoomData {
     centerX: number;
     centerY: number;
     doors: { x: number; y: number }[];
-    isSecretRoom: boolean;
+    theme: RoomTheme;
 }
 
 export class SpawnManager {
     private grid: number[][];
     private roomRegistry: Map<string, RoomData>;
-    private startDoor: { x: number; y: number };
-    private exitRoomCenter: { x: number; y: number };
+    private spawnTable: any;
 
     constructor(
         grid: number[][],
         rooms: any[],
         startDoor: { x: number; y: number; w: number; h: number },
         exitRoomCenter: { x: number; y: number },
-        secretRoomCells: { gx: number; gy: number }[]
+        spawnTable: any
     ) {
         this.grid = grid;
+        this.spawnTable = spawnTable;
         this.startDoor = { x: Math.floor(startDoor.x / TILE_SIZE), y: Math.floor(startDoor.y / TILE_SIZE) };
         this.exitRoomCenter = { x: Math.floor(exitRoomCenter.x / TILE_SIZE), y: Math.floor(exitRoomCenter.y / TILE_SIZE) };
-        this.roomRegistry = this.buildRoomRegistry(rooms, secretRoomCells);
+        this.roomRegistry = this.buildRoomRegistry(rooms);
     }
 
-    private buildRoomRegistry(rooms: any[], secretRoomCells: { gx: number; gy: number }[]): Map<string, RoomData> {
+    private buildRoomRegistry(rooms: any[]): Map<string, RoomData> {
         const registry = new Map<string, RoomData>();
+        const normalRooms: any[] = [];
+        
+        // 1. First pass: identify secret rooms and candidates for special themes
         rooms.forEach((room: any, idx: number) => {
             const roomId = `room_${idx}`;
             const doors: { x: number; y: number }[] = [];
             room.getDoors((x: number, y: number) => doors.push({ x, y }));
 
-            const isSecretRoom = secretRoomCells.some(c =>
-                c.gx >= room.getLeft() && c.gx <= room.getRight() &&
-                c.gy >= room.getTop() && c.gy <= room.getBottom()
-            );
-
-            registry.set(roomId, {
+            const roomData: RoomData = {
                 id: roomId,
                 left: room.getLeft(),
                 right: room.getRight(),
@@ -60,10 +68,63 @@ export class SpawnManager {
                 centerX: room.getCenter()[0],
                 centerY: room.getCenter()[1],
                 doors,
-                isSecretRoom
-            });
+                theme: RoomTheme.DEFAULT
+            };
+
+            // Detect secret rooms from BSP generator
+            if ((room as any).getBSPRoom && (room as any).getBSPRoom().isSecret) {
+                roomData.theme = RoomTheme.TREASURY;
+            }
+            
+            registry.set(roomId, roomData);
+            
+            // Collect eligible non-lobby rooms for special themes
+            if (!this.isStartRoom(roomData) && !this.isExitRoom(roomData) && roomData.theme !== RoomTheme.TREASURY) {
+                normalRooms.push(roomData);
+            }
         });
+
+        // 2. Second pass: distribute special themes from a pool
+        const themePool: RoomTheme[] = [
+            RoomTheme.ARENA,
+            RoomTheme.PRISON,
+            RoomTheme.ARMORY,
+            RoomTheme.WAREHOUSE,
+            RoomTheme.MINEFIELD
+        ];
+
+        // Shuffle normal rooms to pick random ones for themes
+        const shuffledRooms = normalRooms.sort(() => ROT.RNG.getUniform() - 0.5);
+        
+        themePool.forEach(theme => {
+            if (shuffledRooms.length > 0) {
+                const room = shuffledRooms.pop()!;
+                room.theme = theme;
+            }
+        });
+
         return registry;
+    }
+
+    public getRoomThemes(): Map<string, RoomTheme> {
+        const themes = new Map<string, RoomTheme>();
+        this.roomRegistry.forEach(r => themes.set(r.id, r.theme));
+        return themes;
+    }
+
+    /**
+     * Возвращает все клетки пола внутри комнаты
+     */
+    public getRoomFloorCells(room: RoomData): {gx: number, gy: number, x: number, y: number}[] {
+        const cells: {gx: number, gy: number, x: number, y: number}[] = [];
+        for (let x = room.left; x <= room.right; x++) {
+            for (let y = room.top; y <= room.bottom; y++) {
+                if (this.grid[x][y] === 0) {
+                    cells.push({ gx: x, gy: y, x: x * TILE_SIZE + TILE_SIZE / 2, y: y * TILE_SIZE + TILE_SIZE / 2 });
+                }
+            }
+        }
+        return cells;
     }
 
     /**
@@ -106,7 +167,7 @@ export class SpawnManager {
                 floorNeighbors++;
             }
         }
-        return floorNeighbors < 5;
+        return floorNeighbors < 7; // More inclusive for corridors
     }
 
     /**
@@ -155,8 +216,9 @@ export class SpawnManager {
 
         for (let x = 0; x < MAP_COLS; x++) {
             for (let y = 0; y < MAP_ROWS; y++) {
-                // Пропускаем безопасную зону
-                if (y >= 19) continue;
+                // Skip safe zone (now dynamic via isNearDoors)
+                // if (y >= 19) continue; 
+
                 // Должен быть пол
                 if (this.grid[x][y] !== 0) continue;
                 // Не должен быть в комнате
@@ -181,11 +243,13 @@ export class SpawnManager {
      * Проверяет валидность позиции для спавна в комнате
      */
     isValidRoomSpawn(gx: number, gy: number, minWallDistance: number = 1, minDoorDistance: number = 3): boolean {
+        // Bounds check
+        if (gx < 0 || gy < 0 || gx >= MAP_COLS || gy >= MAP_ROWS) return false;
         // Должен быть пол
         if (this.grid[gx][gy] !== 0) return false;
         // Должен быть внутри комнаты (не коридор)
         const room = this.getRoomForCell(gx, gy);
-        if (!room || room.isSecretRoom) return false;
+        if (!room) return false;
         // Не должен быть в исключенных комнатах
         if (!this.isRoomEligible(room)) return false;
         // Не рядом со стенами
@@ -199,8 +263,6 @@ export class SpawnManager {
      * Проверяет, может ли комната использоваться для спавна
      */
     isRoomEligible(room: RoomData): boolean {
-        // Исключаем секретные комнаты
-        if (room.isSecretRoom) return false;
         // Исключаем комнату со стартовой дверью
         if (this.isStartRoom(room)) return false;
         // Исключаем комнату с выходом
@@ -246,6 +308,87 @@ export class SpawnManager {
         if (spawns.length === 0) return null;
         const index = Math.floor(ROT.RNG.getUniform() * spawns.length);
         return spawns.splice(index, 1)[0];
+    }
+
+    /**
+     * Finds optimal spawn points for groups in each room.
+     * Points are chosen to be in the center area, away from walls.
+     */
+    getOptimalSpawnPoints(): { gx: number; gy: number; x: number; y: number; roomId: string }[] {
+        const points: { gx: number; gy: number; x: number; y: number; roomId: string }[] = [];
+        const eligibleRooms = this.getEligibleRooms();
+
+        for (const room of eligibleRooms) {
+            const roomCandidates: { gx: number; gy: number; x: number; y: number; score: number }[] = [];
+
+            // Search for the point with maximum "safety" (distance to walls and doors)
+            for (let x = room.left; x <= room.right; x++) {
+                for (let y = room.top; y <= room.bottom; y++) {
+                    if (this.grid[x][y] !== 0) continue;
+                    
+                    // Basic distance to walls
+                    let minDistToWall = 5;
+                    for (let dx = -3; dx <= 3; dx++) {
+                        for (let dy = -3; dy <= 3; dy++) {
+                            const nx = x + dx, ny = y + dy;
+                            if (nx < 0 || ny < 0 || nx >= MAP_COLS || ny >= MAP_ROWS || this.grid[nx][ny] === 1) {
+                                minDistToWall = Math.min(minDistToWall, Math.max(Math.abs(dx), Math.abs(dy)));
+                            }
+                        }
+                    }
+
+                    // Avoid doors
+                    if (this.isNearDoors(x, y, 3)) continue;
+
+                    // Heuristic score: favor distance from walls and proximity to center
+                    const distToCenter = Math.hypot(x - room.centerX, y - room.centerY);
+                    const score = minDistToWall * 10 - distToCenter;
+
+                    if (score > 0) {
+                        roomCandidates.push({
+                            gx: x, gy: y,
+                            x: x * TILE_SIZE + TILE_SIZE / 2,
+                            y: y * TILE_SIZE + TILE_SIZE / 2,
+                            score
+                        });
+                    }
+                }
+            }
+
+            // Сортируем кандидатов по качеству
+            roomCandidates.sort((a, b) => b.score - a.score);
+
+            // В больших комнатах делаем несколько точек спавна
+            const roomArea = (room.right - room.left) * (room.bottom - room.top);
+            const maxPointsInRoom = roomArea > 80 ? 3 : (roomArea > 40 ? 2 : 1);
+            
+            const selectedInRoom: any[] = [];
+            for (const cand of roomCandidates) {
+                if (selectedInRoom.length >= maxPointsInRoom) break;
+                
+                // Проверка дистанции до уже выбранных точек в этой комнате (минимум 5 клеток)
+                const tooClose = selectedInRoom.some(p => Math.hypot(p.gx - cand.gx, p.gy - cand.gy) < 5);
+                if (!tooClose) {
+                    selectedInRoom.push(cand);
+                    points.push({ ...cand, roomId: room.id });
+                }
+            }
+        }
+        return points;
+    }
+
+    /**
+     * Выбирает случайного врага на основе весов из таблицы спавна биома
+     */
+    public getRandomEnemy(): string {
+        const totalWeight = this.spawnTable.enemies.reduce((sum: number, e: any) => sum + e.weight, 0);
+        let roll = ROT.RNG.getUniform() * totalWeight;
+        
+        for (const enemy of this.spawnTable.enemies) {
+            roll -= enemy.weight;
+            if (roll <= 0) return enemy.id;
+        }
+        return this.spawnTable.enemies[0].id;
     }
 
     /**

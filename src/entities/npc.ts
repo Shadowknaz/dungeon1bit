@@ -1,33 +1,18 @@
 import { addComponent, IWorld } from 'bitecs';
-import { Position, NpcTag } from '../components';
+import { Position, NpcTag } from '../domain/components';
+import { NPC, DialogNode } from '../domain/types';
 
-export interface DialogOption {
-    text: string;
-    next?: DialogNode;
-    action?: 'close' | 'buy_random' | 'heal';
-}
-
-export interface DialogNode {
-    text: string;
-    options: DialogOption[];
-}
-
-export interface NPCState {
-    x: number;
-    y: number;
-    radius: number;
-    type: 'merchant' | 'shrine' | 'civilian';
-    dialogTree: DialogNode;
-    currentNode: DialogNode | null;
-}
-
-export function createMerchant(world: IWorld, eid: number, x: number, y: number): NPCState {
+export function createMerchant(world: IWorld, eid: number, x: number, y: number): NPC {
     addComponent(world, NpcTag, eid);
     addComponent(world, Position, eid);
     Position.x[eid] = x;
     Position.y[eid] = y;
     return {
-        x, y,
+        eid,
+        get x() { return Position.x[eid]; },
+        set x(v) { Position.x[eid] = v; },
+        get y() { return Position.y[eid]; },
+        set y(v) { Position.y[eid] = v; },
         radius: 10,
         type: 'merchant',
         dialogTree: {
@@ -38,16 +23,20 @@ export function createMerchant(world: IWorld, eid: number, x: number, y: number)
             ]
         },
         currentNode: null
-    };
+    } as any as NPC;
 }
 
-export function createAltar(world: IWorld, eid: number, x: number, y: number): NPCState {
+export function createAltar(world: IWorld, eid: number, x: number, y: number): NPC {
     addComponent(world, NpcTag, eid);
     addComponent(world, Position, eid);
     Position.x[eid] = x;
     Position.y[eid] = y;
     return {
-        x, y,
+        eid,
+        get x() { return Position.x[eid]; },
+        set x(v) { Position.x[eid] = v; },
+        get y() { return Position.y[eid]; },
+        set y(v) { Position.y[eid] = v; },
         radius: 15,
         type: 'shrine',
         dialogTree: {
@@ -58,10 +47,10 @@ export function createAltar(world: IWorld, eid: number, x: number, y: number): N
             ]
         },
         currentNode: null
-    };
+    } as any as NPC;
 }
 
-export function createCivilian(world: IWorld, eid: number, x: number, y: number): NPCState {
+export function createCivilian(world: IWorld, eid: number, x: number, y: number): NPC {
     addComponent(world, NpcTag, eid);
     addComponent(world, Position, eid);
     Position.x[eid] = x;
@@ -73,7 +62,11 @@ export function createCivilian(world: IWorld, eid: number, x: number, y: number)
         "Говорят, в стенах есть секретные плиты."
     ];
     return {
-        x, y,
+        eid,
+        get x() { return Position.x[eid]; },
+        set x(v) { Position.x[eid] = v; },
+        get y() { return Position.y[eid]; },
+        set y(v) { Position.y[eid] = v; },
         radius: 10,
         type: 'civilian',
         dialogTree: {
@@ -81,5 +74,5 @@ export function createCivilian(world: IWorld, eid: number, x: number, y: number)
             options: [{ text: "[Уйти]", action: 'close' }]
         },
         currentNode: null
-    };
+    } as any as NPC;
 }
